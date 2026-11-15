@@ -85,8 +85,14 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 256);
+  /* definition and creation of defaultTask
+   * 移植调整：256 词（1 KB）时，imu_module_init() 的调用链
+   *   imu_module_init → imu_service_start → capture.init() → s_imu.init()
+   *   → calibrate() → read() → SPI 中间件 → 驱动解包
+   * 在 -O0 下累计栈帧超过 1 KB，会踩坏 FreeRTOS 堆中相邻的 TCB / 任务栈，
+   * 表现为运行约 1 秒后 PendSV 恢复上下文时 r3 为垃圾值 → HardFault。
+   * 这里给到 1024 词（4 KB），留足余量。 */
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 1024);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */

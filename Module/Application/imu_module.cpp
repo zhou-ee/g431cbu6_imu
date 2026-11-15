@@ -23,7 +23,7 @@ int imu_module_init(void) {
             imu_module_init_result = -2; /* 任务/信号量创建失败（FreeRTOS 堆不足） */
             break;
         case pyro::PYRO_PARAM_ERROR:
-            imu_module_init_result = -3; /* 算法任务创建失败 */
+            imu_module_init_result = -3; /* VQF 配置失败或算法任务创建失败 */
             break;
         default:
             imu_module_init_result = -1; /* 器件初始化失败 */

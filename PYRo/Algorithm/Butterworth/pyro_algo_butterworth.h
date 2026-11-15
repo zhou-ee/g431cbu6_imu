@@ -37,6 +37,11 @@ template <std::size_t Channels> class butterworth_lpf_t
     static_assert(Channels > 0, "At least one filter channel is required");
 
   public:
+    /* 观测用：系数重算次数（含 exp/cos/sin）。稳态应几乎不增长；
+     * 若持续增长说明 dt 在抖，VQF 会被 double 超越函数拖慢。
+     * 多实例累加，仅供调试观察，不影响功能。 */
+    inline static volatile uint32_t coeff_recalc_count = 0U;
+
     /** @brief 修改时间常数并保持输出连续，失败保留配置和状态。
      *         Set tau while preserving the output and its derivative.
      */
@@ -99,13 +104,21 @@ template <std::size_t Channels> class butterworth_lpf_t
             return PYRO_OK;
         }
 
-        if (dt != _cached_period)
+        /* dt 缓存：变步长下只在 dt 改变时重算系数（含 exp/cos/sin，M4F 无双精度
+         * FPU 时每次约 20~40 us）。用相对容差替代精确相等：dt 由
+         * ticks * timestamp_tick_s 算出，理论上恒定，但采样抖动会让末位差 1 ULP，
+         * 精确相等会把缓存打穿、退化到每样本都重算。 */
+        const bool period_changed =
+            (_cached_period <= 0.0f) ||
+            (std::fabs(dt - _cached_period) > (1.0e-4f * _cached_period));
+        if (period_changed)
         {
             const double ratio = static_cast<double>(dt) / _tau;
             const double decay = std::exp(-ratio);
             _decay_cos = decay * std::cos(ratio);
             _decay_sin = decay * std::sin(ratio);
             _cached_period = dt;
+            ++coeff_recalc_count; /* 观测：稳态应几乎不增长 */
         }
         // y'' + (2/tau)y' + (2/tau²)y = (2/tau²)x。
         // 状态为 [y, tau*y']，dt 变化保持状态连续，长间隔也稳定。

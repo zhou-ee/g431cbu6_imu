@@ -87,6 +87,17 @@ target_include_directories(PYRo PUBLIC
 target_link_libraries(PYRo PUBLIC stm32cubemx CMSISDSP)
 
 # ------------------------------------------------------------------------------
+# 算法/驱动库按 -O2 编译（覆盖 Debug 的 -O0）
+#
+# 原因：VQF 的零偏卡尔曼滤波每样本要跑 3x3 矩阵求逆、协方差更新与多个
+# Butterworth 二阶低通的变步长递推（含 double 版 exp）。-O0 下实测单样本
+# 高达 ~230 us，而 7.68 kHz 双路的实时预算只有 65 us/样本，直接打穿。
+# 库代码不需要单步调试（应用层 Module/ 仍是 -O0，可以正常打断点）。
+# ------------------------------------------------------------------------------
+target_compile_options(PYRo PRIVATE -O2)
+target_compile_options(PYRo PRIVATE $<$<CONFIG:Debug>:-O2>)
+
+# ------------------------------------------------------------------------------
 # 可选项：把 DMA 堆放进专用段（H7 等需要避开 DTCM 的芯片）
 #   G4 的 32KB SRAM 全部可被 DMA 访问，本工程默认不定义 → ucDmaHeap 留在 .bss。
 #   如需专用段，取消下一行注释并同步在 .ld 中增加对应的输出段。

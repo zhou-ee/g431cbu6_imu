@@ -186,13 +186,22 @@ status_t vqf_t::update(const imu_data_t &data)
     if (!_bias_kf.is_initialized())
         return PYRO_NOT_FOUND;
     if (!valid_stream(data.gyro) || !valid_stream(data.acc))
+    {
+        err_stage = 1;
         return PYRO_PARAM_ERROR;
+    }
     if (data.gyro.count == 0 && data.acc.count == 0)
         return PYRO_OK;
     if (!std::isfinite(data.timestamp_tick_s) || data.timestamp_tick_s <= 0.0f)
+    {
+        err_stage = 2;
         return PYRO_PARAM_ERROR;
+    }
     if (_state.timestamp_tick_s != 0.0f && _state.timestamp_tick_s != data.timestamp_tick_s)
+    {
+        err_stage = 3;
         return PYRO_PARAM_ERROR;
+    }
 
     uint8_t &gyr_index = _state.consumed_gyr;
     uint8_t &acc_index = _state.consumed_acc;
@@ -211,10 +220,16 @@ status_t vqf_t::update(const imu_data_t &data)
         sample_clock_t &clock = gyro_first ? _state.gyr_clock : _state.acc_clock;
         const uint32_t ticks = timestamp - clock.timestamp;
         if (clock.initialized && ticks >= (uint32_t{1} << 31))
+        {
+            err_stage = 4; /* 时间戳倒退 */
             return PYRO_PARAM_ERROR;
+        }
         const float dt = clock.initialized ? static_cast<float>(ticks) * data.timestamp_tick_s : 0.0f;
         if (!std::isfinite(dt) || (clock.initialized && ticks > 0 && dt <= 0.0f))
+        {
+            err_stage = 5;
             return PYRO_PARAM_ERROR;
+        }
         const bool duplicate = clock.initialized && ticks == 0;
         status_t result = PYRO_WARNING;
         if (gyro_first)

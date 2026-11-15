@@ -64,10 +64,12 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 7 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-/* 移植调整：3072 B 只够 CubeMX 默认任务。采集链路新增两个常驻任务
- * （capture 1 KB + algo 0.75 KB 栈）及各自 TCB、一个二值信号量，
- * 统一按 8 KB 规划；具体数值待上板测栈高水位后收敛。 */
-#define configTOTAL_HEAP_SIZE                    ((size_t)8192)
+/* 移植调整：CubeMX 默认 3072 B 只够一个空任务。本产品需要
+ *   defaultTask 1024 词 + imu 任务 1024 词 + IDLE 128 词
+ *   + 3 个 TCB + 若干锁 ≈ 9.2 KB，取 12 KB 留余量。
+ * （早期给 8192 B 时堆已接近上限；defaultTask 承担 imu 初始化调用链，
+ *   曾因栈溢出踩坏堆块导致 HardFault，故两个任务栈都给 1024 词。） */
+#define configTOTAL_HEAP_SIZE                    ((size_t)12288)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_16_BIT_TICKS                   0
 #define configUSE_MUTEXES                        1
@@ -95,6 +97,8 @@ to exclude the API function. */
 #define INCLUDE_vTaskDelayUntil               1
 #define INCLUDE_vTaskDelay                   1
 #define INCLUDE_xTaskGetSchedulerState       1
+/* 堆用量观测：调试器直接看 ucHeap 剩余量，判断任务栈是否把堆吃紧。 */
+#define INCLUDE_uxTaskGetStackHighWaterMark  1
 
 /* Cortex-M specific definitions. */
 #ifdef __NVIC_PRIO_BITS

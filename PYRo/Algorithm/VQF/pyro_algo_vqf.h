@@ -76,8 +76,7 @@ class vqf_t
      * Rest criteria changes restart detection.
      * bias_sigma_init sets the prior on reset.
      */
-    status_t configure(const config_t &config = config_t{});
-    /** @brief 重置全部状态，可指定初始零偏及标准差，单位 rad/s。
+    status_t configure(const config_t &config = config_t{});    /** @brief 重置全部状态，可指定初始零偏及标准差，单位 rad/s。
      *         Reset all state with optional initial bias/sigma in rad/s.
      * sigma=0 使用配置的 bias_sigma_init / Zero sigma uses configured prior.
      */
@@ -162,6 +161,13 @@ class vqf_t
     butterworth_lpf_t<3> _rest_acc_lp{};
     butterworth_lpf_t<9> _motion_rotation_lp{};
     butterworth_lpf_t<2> _motion_bias_lp{};
+
+  public:
+    /* 诊断：最近一次 update 走到哪个 PARAM_ERROR 分支（0 = 未报错）。
+     *   1=stream 非法 2=tick_s 非法 3=tick_s 变化
+     *   4=时间戳倒退 5=dt 非正
+     * 仅用于上板定位，不影响算法行为。 */
+    inline static volatile uint32_t err_stage = 0U;
 };
 
 } // namespace pyro
