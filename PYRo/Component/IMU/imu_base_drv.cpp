@@ -5,9 +5,9 @@ imu_base_drv::~imu_base_drv() = default;
 
 /**
  * @brief 陀螺零偏 + 重力模长标定
- * @note  依赖派生类 update() 的语义："取回一批样本，陀螺写入 gyro_sample、
+ * @note  依赖派生类 read() 的语义："取回一批样本，陀螺写入 gyro_sample、
  *        加速度写入 acc 流，两者未被消费的数量体现在 acc.count / gyro.count"。
- *        update() 无返回值，因此靠这两个计数判断本批有没有新数据。
+ *        本函数不关心 read() 的返回值，只按两路计数判断本批有没有新数据。
  *        标定期间器件需保持静止。两路独立计数，各自攒够 target 个样本为止
  *        （陀螺/加速度同速率时同步完成；7680 Hz 下 500 个约 65 ms）。
  *        本函数会**消费**样本（读后调 assume_*），避免下一轮重复累加同一批。
@@ -35,7 +35,7 @@ bool imu_base_drv::calibrate() {
     while (got_gyro < static_cast<uint32_t>(target) || got_acc < static_cast<uint32_t>(target)) {
         const uint32_t previous_gyro_count = got_gyro;
         const uint32_t previous_acc_count = got_acc;
-        update();
+        (void)read(); /* 标定不关心返回值，只看两路 count */
 
         const uint8_t ng = _data.gyro.count;
         const uint8_t na = _data.acc.count;

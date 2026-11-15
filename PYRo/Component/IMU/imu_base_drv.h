@@ -142,11 +142,19 @@ class imu_base_drv {
     virtual bool init() = 0;
 
     /**
-     * @brief 取一批样本（非阻塞，仅限任务上下文）。
-     * @note  无返回值：本批有没有新数据看 acc.count / gyro.count。
-     *        实现须保证：无新数据时不改变 count；缓冲满时覆盖最旧的未消费样本。
+     * @brief 读取一拍数据并解包（仅限任务上下文）。
+     *
+     * 单一读取入口：内部按配置自行决定数据来源（器件 FIFO 批量 / 输出寄存器直读），
+     * 调用方不需要知道走了哪条路径，也不需要感知"状态查询"这一步。
+     * 典型实现为两段式：先发起状态事务、经完成中断唤醒后判读，再发起数据事务、
+     * 再次唤醒后收取并解包。等待期间让出 CPU，不做轮询。
+     *
+     * @retval true  本拍解出了新样本（见 acc.count / gyro.count）
+     * @retval false 本拍没有新数据，或超时 / 总线失败（区分方式见 diag()）
+     *
+     * @note  无数据时不得改变 count；缓冲满时覆盖最旧的未消费样本。
      */
-    virtual void update() = 0;
+    virtual bool read() = 0;
 
     protected:
     imu_data_t _data;

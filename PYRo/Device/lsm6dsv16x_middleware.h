@@ -11,6 +11,11 @@
 constexpr uint16_t LSM6DSV16X_MAX_BURST = 256U;
 constexpr uint8_t LSM6DSV16X_TIMEOUT_MS = 0xFF;
 
+/* 单笔 DMA 事务的完成等待上限（ms）。驱动 read() 依赖它把"等通知"限时，
+ * 避免总线异常时把 1 ms 采集周期拖死。正常路径远小于此值：
+ * 状态帧 3 B ≈ 5 µs，满帧 252 B ≈ 380 µs（SPI 5.3125 Mbit/s）。 */
+constexpr uint32_t LSM6DSV16X_CPLT_TIMEOUT_MS = 2U;
+
 /* 普通寄存器小读使用独立缓冲；FIFO DMA 使用 read_fifo() 管理。 */
 
 constexpr uint16_t LSM6DSV16X_SYNC_READ_MAX = 2U;
@@ -31,6 +36,33 @@ public:
      * 调用方始终先处理 received_len，再处理返回的总线状态。 */
     virtual bool read_fifo(uint8_t *buf, uint16_t capacity, uint16_t request_len,
                            uint16_t &received_len);
+
+    /* ---------------- 异步寄存器读（与 read_fifo 同套流水语义） ----------------
+     * request → wait_dma → collect 三段，供驱动按"发起 / 让出 CPU 等通知 / 收取"
+     * 组织一轮采集。不支持异步的实现返回 false / true，由驱动退化同步读取。 */
+
+    /* 发起一次寄存器读：成功时事务已在途，须用 wait_dma() 等完成再 collect。
+     * false = 不支持异步 / 已有事务在途 / 启动失败。 */
+    virtual bool read_regs_request(uint8_t reg, uint16_t len) {
+        (void)reg;
+        (void)len;
+        return false;
+    }
+    /* 收取 read_regs_request 已完成的字节：仅在 wait_dma() 成功后调用。
+     * false = 无在途事务或长度不符（缓冲不变）。 */
+    virtual bool read_regs_collect(uint8_t *buf, uint16_t len) {
+        (void)buf;
+        (void)len;
+        return false;
+    }
+    /* 让出 CPU 等待在途事务的完成通知（DMA 完成中断在 ISR 中给出信号）。
+     * true = 已完成；false = 超时或总线错误，在途状态已被清理。
+     * 同步实现无事可等，直接返回 true。 */
+    virtual bool wait_dma(uint32_t timeout_ms) {
+        (void)timeout_ms;
+        return true;
+    }
+
     bool read_reg(const uint8_t reg, uint8_t *buf) {
         return read_regs(reg, buf, 1);
     }
@@ -48,6 +80,9 @@ public:
     bool write_regs(uint8_t reg, uint8_t *buf, uint16_t len) override;
     bool read_fifo(uint8_t *buf, uint16_t capacity, uint16_t request_len,
                    uint16_t &received_len) override;
+    bool read_regs_request(uint8_t reg, uint16_t len) override;
+    bool read_regs_collect(uint8_t *buf, uint16_t len) override;
+    bool wait_dma(uint32_t timeout_ms) override;
 private:
     SPI_HandleTypeDef *_spi_handle;
     GPIO_TypeDef *_cs_port;
@@ -67,9 +102,13 @@ private:
 
     /* 小读（≤ LSM6DSV16X_SYNC_READ_MAX 字节）专用暂存：容量刚好装下地址字节 + 数据。
      * 独立于 _tx/_rx，保证阻塞小读不会踩到在途的大读 DMA（小读每周期都发生，
-     * 若共用大读的双缓冲会立刻打乱其交替次序）。写事务也用这块。 */
+     * 若共用大读的双缓冲会立刻打乱其交替次序）。写事务也用这块。
+     * 异步小读（read_regs_request/collect）同样借用这块：同一时刻只有一笔小读在途。 */
     uint8_t _sm_tx[LSM6DSV16X_SYNC_READ_MAX + 1U]{};
     uint8_t _sm_rx[LSM6DSV16X_SYNC_READ_MAX + 1U]{};
+
+    /* 在途异步小读的数据长度（不含地址字节），0 表示没有在途小读。 */
+    uint16_t _sm_len{};
 
     /* SPI 收发引擎（PYRo/Peripheral/SPI，仿 UART 驱动：阻塞 + DMA 双 API）：
      * 小读/写走 txrx/tx（阻塞），大读走 txrx_dma（发起即返回）。

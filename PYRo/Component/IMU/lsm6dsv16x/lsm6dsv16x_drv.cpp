@@ -5,7 +5,7 @@
   *
   * 文件结构：
   *   ① 常量与"映射/工具函数"的前向声明
-  *   ② 关键实现：init() / update()（FIFO + 器件时间戳路径 / 直读回退路径）
+  *   ② 关键实现：init() / read()（FIFO 两段式 + 器件时间戳 / 直读回退）
   *   ③ 文件末尾：映射表的具体实现（配置项 → 寄存器编码，与主流程无关）
   ******************************************************************************
   */
@@ -113,7 +113,7 @@ bool lsm6dsv16x_drv_t::init() {
 
     /* 6) FIFO 路径（fifo_en）：BDR=ODR 不降采样；先定 BDR 后切模式，bypass→continuous
      *    会复位 FIFO，此时为空无害；时间戳逐槽批入、温度 60Hz、Continuous 满后覆盖最旧。
-     *    关闭则显式留 bypass，update() 走直读回退。 */
+     *    关闭则显式留 bypass，read() 走直读回退。 */
     if (_data.cfg.fifo_en) {
         if (!_device.write_reg(FIFO_CTRL3,
                                static_cast<uint8_t>((gy_odr << FIFO_CTRL3_BDR_GY_POS) | xl_odr)) ||
@@ -127,7 +127,7 @@ bool lsm6dsv16x_drv_t::init() {
         return false; /* 软复位后默认即 bypass，显式写一次便于阅读 */
     }
 
-    /* 7) 可选：陀螺零偏标定（标定期间器件需保持静止，走 update() 批量平均） */
+    /* 7) 可选：陀螺零偏标定（标定期间器件需保持静止，走 read() 批量平均） */
     if (_data.cfg.calibrate_flag) {
         if (!calibrate()) {
             return false;
@@ -143,15 +143,16 @@ bool lsm6dsv16x_drv_t::init() {
  * @note  时间戳直读 TIMESTAMP0~3 计数器（与 FIFO 路径同一计数器、同一时间基准）；
  *        只需相对时间（帧间差），不做绝对时刻补偿。
  * @note  普通 read_regs 同步返回；此处保留逐寄存器读取路径供直读对比。
+ * @return true = 本拍产出了样本；false = 无新数据 / 总线失败。
  */
-void lsm6dsv16x_drv_t::update_direct() {
+bool lsm6dsv16x_drv_t::read_direct() {
     uint8_t st = 0U;
     if (!_device.read_reg(STATUS_REG, &st)) {
         ++_fifo.err_bus;
-        return;
+        return false;
     }
     if ((st & STATUS_REG_XLDA) == 0U || (st & STATUS_REG_GDA) == 0U) {
-        return; /* 无新数据：不动已有样本 */
+        return false; /* 无新数据：不动已有样本 */
     }
 
     /* 20h~2Dh：温度 1 + 陀螺 3 + 加速度 3，共 7 个 int16（小端）。
@@ -159,7 +160,7 @@ void lsm6dsv16x_drv_t::update_direct() {
     for (uint16_t i = 0U; i < OUT_BURST_LEN; ++i) {
         if (!_device.read_regs(static_cast<uint8_t>(OUT_BURST_START + i), &_fifo_raw[i], 1U)) {
             ++_fifo.err_bus;
-            return;
+            return false;
         }
     }
     const int16_t *raw = reinterpret_cast<const int16_t *>(_fifo_raw);
@@ -206,60 +207,93 @@ void lsm6dsv16x_drv_t::update_direct() {
     a.Accel[1] = static_cast<float>(raw[5]) * acc_lsb;
     a.Accel[2] = static_cast<float>(raw[6]) * acc_lsb;
     remap_axis(a.Accel, idx, neg);
+    return true;
 }
 
 /**
- * @brief 取样本（非阻塞；仅限任务上下文）：按 fifo_en 分派。
- * @note  无返回值：本次有没有拿到新样本看 acc.count / gyro.count 是否为 0。
- *        FIFO 路径是异步流水：本拍解析**上一拍发起的那一帧**，解析完立刻为下一拍
- *        发起新帧，随后不等待、正常返回。端到端延迟固定 +1 拍（1 ms），
- *        但样本自带器件时间戳，不影响时间精度。
+ * @brief 单一读取入口（仅限任务上下文）：按 fifo_en 分派，数据来源对上层不可见。
  */
-void lsm6dsv16x_drv_t::update() {
+bool lsm6dsv16x_drv_t::read() {
     if (_data.cfg.fifo_en) {
-        update_batch();
-    } else {
-        update_direct();
+        return read_fifo_batch();
     }
+    return read_direct();
 }
 
 /**
- * @brief FIFO 批量路径：取回已完成的整批数据，再发起本次请求。
- * @note read_fifo 独立报告交付长度，批次变短或 FIFO 暂空时仍完整解析上一批。
- *       下一笔启动失败时，已交付的上一批仍正常解析；缓冲在忙时留待后续调用。
+ * @brief FIFO 两段式批量读取：状态事务 → 判读 → 数据事务 → 解包。
+ *
+ * 每笔事务都是"发起 → 让出 CPU 等完成中断唤醒 → 收取"，等待期间任务挂在
+ * DMA 完成信号量上，不做轮询。状态字节、待读字数、交付字节数全是本函数局部量，
+ * 判读结果（有无数据、溢出）在内部消化，不上浮给调用方。
+ *
+ * @retval true  解出了样本（数量见 acc.count / gyro.count）
+ * @retval false 本拍无数据（diff==0，正常情况）或超时 / 总线失败
+ * @note  两段各自独立限时；任一失败即结束本拍，不残留跨拍的中间状态。
  */
-void lsm6dsv16x_drv_t::update_batch() {
-    /* 状态决定本次请求字数，交付字数由总线层独立返回。 */
+bool lsm6dsv16x_drv_t::read_fifo_batch() {
+    /* ---- ① 状态事务：发起 → 让出 CPU 等唤醒 → 取回 2 字节 ----
+     * 失败即结束本拍：read_regs_request 返回 false 的原因可能是"已有事务在途"，
+     * 此时若改走同步 read_regs 会与在途 DMA 抢总线，故不做同步回退。
+     * 不支持异步的总线由基类 read_regs_request 的默认实现返回 false，
+     * 这类实现会走 read_direct() 路径（fifo_en 场合通常都是异步总线）。 */
     uint8_t st[2] = {0U, 0U};
-    if (!_device.read_regs(FIFO_STATUS1, st, 2U)) {
+    if (!_device.read_regs_request(FIFO_STATUS1, 2U)) {
         ++_fifo.err_bus;
-        return;
+        return false;
     }
-    const uint16_t diff = static_cast<uint16_t>(st[0] | ((st[1] & FIFO_STATUS2_DIFF_FIFO_8) << 8));
+    if (!_device.wait_dma(LSM6DSV16X_CPLT_TIMEOUT_MS)) {
+        ++_fifo.err_timeout;
+        return false;
+    }
+    if (!_device.read_regs_collect(st, 2U)) {
+        ++_fifo.err_bus;
+        return false;
+    }
 
-    /* 溢出（continuous 丢最旧）：数据已损坏，上升沿计数一次 */
+    /* ---- ② 判读：待读字数与溢出（上升沿计数，兼容标志清除语义） ---- */
+    const uint16_t diff =
+        static_cast<uint16_t>(st[0] | ((st[1] & FIFO_STATUS2_DIFF_FIFO_8) << 8));
     const bool ovr_now =
         (st[1] & (FIFO_STATUS2_FIFO_OVR_IA | FIFO_STATUS2_FIFO_OVR_LATCHED)) != 0U;
     if (ovr_now && !_fifo.ovr_prev) {
-        ++_fifo.err_data;
+        ++_fifo.err_data; /* continuous 模式满后覆盖最旧：已丢样本 */
     }
     _fifo.ovr_prev = ovr_now;
 
-    /* 2) 本拍发起长度：≤ MAX_WORDS_PER_XFER 字（一笔 DMA 装得下），剩余下拍续读 */
+    if (diff == 0U) {
+        return false; /* 器件尚未产生新样本：不是错误 */
+    }
+
+    /* 本拍请求长度：≤ MAX_WORDS_PER_XFER 字（一笔 DMA 装得下），剩余下拍续读 */
     uint16_t words = diff;
     if (words > LSM6DSV16X_MAX_WORDS_PER_XFER) {
         words = LSM6DSV16X_MAX_WORDS_PER_XFER;
     }
 
+    /* ---- ③ 数据事务：发起 → 让出 CPU 等唤醒 → 取回 ---- */
     uint16_t received_len = 0U;
-    const bool ok = _device.read_fifo(_fifo_raw, sizeof(_fifo_raw),
-                                      static_cast<uint16_t>(words * 7U), received_len);
-    if (!ok) {
+    if (!_device.read_fifo(_fifo_raw, sizeof(_fifo_raw),
+                           static_cast<uint16_t>(words * 7U), received_len)) {
         ++_fifo.err_bus;
+        return false;
     }
-    for (uint16_t i = 0U; i < received_len / 7U; ++i) {
+    if (!_device.wait_dma(LSM6DSV16X_CPLT_TIMEOUT_MS)) {
+        ++_fifo.err_timeout;
+        return false;
+    }
+    /* request_len=0：只取回已完成的那一帧，不再发起新请求 */
+    if (!_device.read_fifo(_fifo_raw, sizeof(_fifo_raw), 0U, received_len)) {
+        ++_fifo.err_bus;
+        return false;
+    }
+
+    /* ---- ④ 解包：逐 7 字节字按 TAG 分派到两路样本流 ---- */
+    const uint16_t count = static_cast<uint16_t>(received_len / 7U);
+    for (uint16_t i = 0U; i < count; ++i) {
         fifo_parse_word(&_fifo_raw[i * 7U]);
     }
+    return count != 0U;
 }
 
 /**

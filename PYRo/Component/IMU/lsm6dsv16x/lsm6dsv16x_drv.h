@@ -21,21 +21,31 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
     }
     ~lsm6dsv16x_drv_t() override;
     bool init() override;
-    /* FIFO 路径（异步流水）：本拍解析的是**上一拍发起的那一帧**，解析完立刻为下一拍
-     * 发起新帧，随后不等待、正常返回。端到端延迟固定 +1 拍（1 ms），
-     * 但样本自带器件时间戳，不影响时间精度。
-     * 两路各自成流（每样本带时间戳），数量见 acc.count / gyro.count。
-     * fifo_en=false 走直读回退（同构：状态同步、数据区按 DMA 与否分派）。
-     * 无返回值：有没有新数据看 count；样本由 assume_*_point() 消费归还。 */
-    void update() override;
+    /* 单一读取入口（仅限任务上下文）：数据来源对上层不可见。
+     *
+     *   fifo_en=true ：两段式 FIFO 批量读取。先发起 FIFO 状态读、让出 CPU 等
+     *                  完成中断唤醒，判读待读字数并处理溢出；有数据则发起 FIFO
+     *                  读取、再次唤醒后逐 7 字节 TAG 解包成 acc/gyro 两路样本。
+     *                  状态判读完全在内部消化，调用方看不到也无需关心。
+     *   fifo_en=false：状态门控 + 直读输出寄存器，一拍产出一帧（回退路径）。
+     *
+     * 两次等待都通过 DMA 完成信号量挂起任务（非轮询），单次上限
+     * LSM6DSV16X_CPLT_TIMEOUT_MS。
+     *
+     * @retval true  本拍解出了样本，数量见 acc.count / gyro.count
+     * @retval false 本拍无数据（器件未产生新样本）或超时/总线失败
+     *
+     * 样本由 assume_*_point() 消费归还；无返回值时代可看两路 count。 */
+    bool read() override;
 
-    /* 运行期诊断（只读）。err_bus/err_data 稳态都应恒为 0。 */
+    /* 运行期诊断（只读）。err_bus/err_data/err_timeout 稳态都应恒为 0。 */
     struct diag_t {
-        uint32_t err_bus;   /* 总线失败（状态读或帧读失败） */
-        uint32_t err_data;  /* FIFO 溢出 / 未知 TAG / 样本缓冲覆盖 */
+        uint32_t err_bus;     /* 总线失败（状态读或帧读失败） */
+        uint32_t err_data;    /* FIFO 溢出 / 未知 TAG / 样本缓冲覆盖 */
+        uint32_t err_timeout; /* 等完成通知超时（DMA 未在期限内完成） */
     };
     [[nodiscard]] diag_t diag() const {
-        return {_fifo.err_bus, _fifo.err_data};
+        return {_fifo.err_bus, _fifo.err_data, _fifo.err_timeout};
     }
 
     private:
@@ -74,21 +84,23 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
     }
 
     /* FIFO 运行状态（私有）：最小错误检测 + 跨调用的解析中间态，上层不依赖。
-     * 样本计数不在这里——stream 的 count 本身就是"待消费样本数"。 */
+     * 样本计数不在这里——stream 的 count 本身就是"待消费样本数"。
+     * 本拍的状态字节、待读字数、交付字节数都是 read() 内的局部量，不落成员。 */
     struct fifo_state_t {
-        volatile uint32_t err_bus;    /* 总线失败次数 */
-        volatile uint32_t err_data;   /* 数据损坏：FIFO 溢出丢样本 / 未知 TAG / 缓冲覆盖最旧 */
-        uint32_t pend_ts;             /* 当前槽时间戳，跨调用保持（读边界可能切在槽中间；
-                                         个别槽无时间戳字时沿用上次值，下一槽即自愈）*/
-        bool     ovr_prev;            /* 溢出标志（上升沿计数，兼容标志清除语义）*/
+        volatile uint32_t err_bus;     /* 总线失败次数 */
+        volatile uint32_t err_data;    /* 数据损坏：FIFO 溢出丢样本 / 未知 TAG / 缓冲覆盖最旧 */
+        volatile uint32_t err_timeout; /* 等完成通知超时次数 */
+        uint32_t pend_ts;              /* 当前槽时间戳，跨调用保持（读边界可能切在槽中间；
+                                          个别槽无时间戳字时沿用上次值，下一槽即自愈）*/
+        bool     ovr_prev;             /* 溢出标志（上升沿计数，兼容标志清除语义）*/
     };
     fifo_state_t _fifo{};
 
-    /* fifo_en 分派：true = FIFO 批量路径（异步流水）；false = 直读回退 */
-    void update_batch();
+    /* read() 分派：true = FIFO 批量路径（两段式）；false = 直读回退 */
+    bool read_fifo_batch();
     void fifo_parse_word(const uint8_t *word);
     /* fifo_en=false 回退路径：STATUS_REG 门控 + 直读 20h~43h（含时间戳）+ 组装 1 帧 */
-    void update_direct();
+    bool read_direct();
 };
 
 #endif

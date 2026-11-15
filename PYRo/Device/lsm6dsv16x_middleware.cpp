@@ -4,6 +4,65 @@
 /* 虚析构必须有定义,否则 vtable 无法生成(链接期 undefined reference) */
 lsm6dsv16x_t::~lsm6dsv16x_t() = default;
 
+/* ---------------------------------------------------------------------------
+ * 异步寄存器读（request → wait_dma → collect）：
+ * 借用 _sm_tx/_sm_rx，与小读共用同一块暂存——同一时刻只允许一笔小读在途，
+ * 由 _sm_len 标记。大读（双槽 _tx[_slot]/_rx[_slot]）与之完全隔离。
+ * ------------------------------------------------------------------------- */
+
+bool lsm6dsv16x_spi_t::read_regs_request(const uint8_t reg, const uint16_t len) {
+    if (!_dma_enable || len == 0U || len > LSM6DSV16X_SYNC_READ_MAX ||
+        _sm_len != 0U || _spi_drv.dma_busy()) {
+        return false; /* 不支持异步 / 参数非法 / 已有事务在途 */
+    }
+
+    _sm_tx[0] = static_cast<uint8_t>(reg | LSM6DSV16X::SPI_READ_BIT);
+    for (uint16_t i = 1U; i <= len; ++i) {
+        _sm_tx[i] = 0x00U;
+    }
+
+    cs_low();
+    if (_spi_drv.txrx_dma(_sm_tx, _sm_rx, static_cast<uint16_t>(len + 1U)) != pyro::PYRO_OK) {
+        cs_high(); /* 未成立的事务：任务侧释放 CS（DMA 路径无完成回调） */
+        return false;
+    }
+    _sm_len = len;
+    return true;
+}
+
+bool lsm6dsv16x_spi_t::read_regs_collect(uint8_t *buf, const uint16_t len) {
+    if (len == 0U || len > LSM6DSV16X_SYNC_READ_MAX || _sm_len != len || !buf) {
+        return false; /* 无在途事务或长度与发起时不一致 */
+    }
+    if (_spi_drv.dma_busy()) {
+        return false; /* 事务未完，调用方应先 wait_dma() 成功后再来收取 */
+    }
+    if (_spi_drv.wait_dma(0U) != pyro::PYRO_OK) {
+        _sm_len = 0U; /* 错误帧作废，避免下一次被误当成功交付 */
+        return false;
+    }
+    for (uint16_t i = 0U; i < len; ++i) {
+        buf[i] = _sm_rx[i + 1U]; /* 第 0 字节是地址阶段的 MISO 残留 */
+    }
+    _sm_len = 0U;
+    return true;
+}
+
+/* 让出 CPU 等待在途事务的完成通知（ISR 中给信号量并由 portYIELD_FROM_ISR 唤醒）。
+ * 超时/错误时：wait_dma 已中止 DMA 且把 state.busy 清零，notify_from_isr 会因
+ * busy==0 提前返回、不再调用完成钩子，因此 CS 必须由任务侧在这里释放；
+ * 否则 CS 一直为低，后续每一帧都会失效。 */
+bool lsm6dsv16x_spi_t::wait_dma(const uint32_t timeout_ms) {
+    if (_spi_drv.wait_dma(timeout_ms) == pyro::PYRO_OK) {
+        return true;
+    }
+    (void)_spi_drv.abort();
+    cs_high();
+    _sm_len  = 0U;
+    _prev_len = 0U; /* 在途大读一并作废，下次调用可重新发起 */
+    return false;
+}
+
 /* 普通寄存器同步读写。FIFO 单独维护请求长度与完整交付长度，
  * 已完成帧只交付一次；即使下一笔启动失败，已交付帧仍由调用方处理。
  * 小读使用独立暂存，普通大读使用当前空闲槽，FIFO DMA 使用双槽轮转。 */

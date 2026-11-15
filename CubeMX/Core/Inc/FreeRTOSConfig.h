@@ -64,7 +64,10 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 7 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-#define configTOTAL_HEAP_SIZE                    ((size_t)3072)
+/* 移植调整：3072 B 只够 CubeMX 默认任务。采集链路新增两个常驻任务
+ * （capture 1 KB + algo 0.75 KB 栈）及各自 TCB、一个二值信号量，
+ * 统一按 8 KB 规划；具体数值待上板测栈高水位后收敛。 */
+#define configTOTAL_HEAP_SIZE                    ((size_t)8192)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_16_BIT_TICKS                   0
 #define configUSE_MUTEXES                        1
@@ -87,7 +90,9 @@ to exclude the API function. */
 #define INCLUDE_vTaskDelete                  1
 #define INCLUDE_vTaskCleanUpResources        0
 #define INCLUDE_vTaskSuspend                 1
-#define INCLUDE_vTaskDelayUntil              0
+/* 移植调整：采集任务按 1 ms 固定周期驱动 IMU（见 Module/IMU/imu_service.cpp），
+ * 需要 vTaskDelayUntil 消除相对延时带来的执行耗时累积（否则会降频）。 */
+#define INCLUDE_vTaskDelayUntil               1
 #define INCLUDE_vTaskDelay                   1
 #define INCLUDE_xTaskGetSchedulerState       1
 

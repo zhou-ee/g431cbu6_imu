@@ -23,5 +23,6 @@ add_executable(${PROJECT_NAME})
 add_subdirectory(CubeMX/cmake/stm32cubemx)
 add_subdirectory(third_party)
 add_subdirectory(PYRo)
+add_subdirectory(Module)
 
-target_link_libraries(${PROJECT_NAME} PYRo stm32cubemx CMSISDSP)
+target_link_libraries(${PROJECT_NAME} PYRo stm32cubemx CMSISDSP IMUProduct)
