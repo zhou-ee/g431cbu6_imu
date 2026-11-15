@@ -1,0 +1,18 @@
+{
+  "CMSIS-DSP": {
+    "source": "E:\\Software\\Develop\\RM\\Wheel_leg\\PYRo-wl\\third_party\\CMSIS-DSP",
+    "source_repository_commit": "356f5020e5b5e68b9719095a7d5fe39910aebfab",
+    "selection": [
+      "Include",
+      "PrivateInclude",
+      "Source",
+      "CMakeLists.txt"
+    ],
+    "license": "Apache-2.0",
+    "license_source": "CubeMX/Drivers/CMSIS/LICENSE.txt",
+    "file_count": 736,
+    "bytes": 13569048,
+    "sha256": "c910393e755350dd17259fd944422dcc1824a9ec02f45deb2d350ca2cd2d3566",
+    "fingerprint_format": "SHA256 of sorted relative-path + NUL + file-SHA256 + LF, UTF-8"
+  }
+}

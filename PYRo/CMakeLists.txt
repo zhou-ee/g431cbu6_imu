@@ -12,10 +12,9 @@ cmake_minimum_required(VERSION 3.22)
 #   Core 依赖  : Def(状态码) / ETL(map) / Memory(DMA 堆) —— 上述模块的直接依赖
 #   Algorithm  : Matrix / KF / Butterworth / VQF（六轴姿态估计）
 #
-# 未移植（需要时再补）：Component、Device、Debug、FSM、Module、ETL 其余部分，
+# 待按产品需要补充：Debug、FSM、Module、ETL 其余部分，
 #   Algorithm 其余部分（Kinematics/OLS/PID/...）及 dsppp（本子集算法未使用）。
-#   CMSIS-DSP 依赖已由根 CMakeLists 以 add_subdirectory(Drivers/CMSIS/DSP) 接入，
-#   目标名 CMSISDSP（新版布局，替换了 CubeMX 自带的旧版 DSP 树）。
+#   CMSIS-DSP 由根目录 third_party 接入，目标名 CMSISDSP。
 # ==============================================================================
 
 add_library(PYRo OBJECT)
@@ -48,6 +47,11 @@ target_sources(PYRo PRIVATE
         # 链接自检（可选）：tests/pyro_algo_link_check.cpp
         Algorithm/Matrix/pyro_algo_matrix.cpp
         Algorithm/VQF/pyro_algo_vqf.cpp
+
+        # --- IMU ---
+        Component/IMU/imu_base_drv.cpp
+        Component/IMU/lsm6dsv16x/lsm6dsv16x_drv.cpp
+        Device/lsm6dsv16x_middleware.cpp
 )
 
 target_include_directories(PYRo PUBLIC
@@ -70,11 +74,14 @@ target_include_directories(PYRo PUBLIC
         Algorithm/KF
         Algorithm/Butterworth
         Algorithm/VQF
+
+        Component/IMU
+        Component/IMU/lsm6dsv16x
+        Device
 )
 
 # 依赖 CubeMX 生成的接口库（提供 HAL、FreeRTOS、CMSIS 的头文件路径与芯片宏）
-# VQF 的 imu_data_t 适配实现使用本工程的 IMU 数据定义。
-target_include_directories(PYRo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../Component/IMU)
+# VQF 与器件驱动共用 Component/IMU 内的 imu_data_t 定义。
 
 # CMSISDSP：Matrix 算法的 CMSIS-DSP 后端（arm_mat_* 系列，含 cholesky / 三角求解）
 target_link_libraries(PYRo PUBLIC stm32cubemx CMSISDSP)
