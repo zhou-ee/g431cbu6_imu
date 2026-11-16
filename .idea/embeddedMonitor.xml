@@ -4,34 +4,19 @@
     <option name="watchItems">
       <list>
         <PersistedWatchItem>
-          <option name="expr" value="imu_service_quat" />
+          <option name="expr" value="s_imu" />
         </PersistedWatchItem>
         <PersistedWatchItem>
-          <option name="expr" value="imu_service_vqf_ready" />
-        </PersistedWatchItem>
-        <PersistedWatchItem>
-          <option name="expr" value="imu_service_read_ok" />
-        </PersistedWatchItem>
-        <PersistedWatchItem>
-          <option name="expr" value="imu_service_algo_rounds" />
-        </PersistedWatchItem>
-        <PersistedWatchItem>
-          <option name="expr" value="imu_service_vqf_consumed" />
-        </PersistedWatchItem>
-        <PersistedWatchItem>
-          <option name="expr" value="imu_service_vqf_us_max" />
-        </PersistedWatchItem>
-        <PersistedWatchItem>
-          <option name="expr" value="imu_service_roll" />
-        </PersistedWatchItem>
-        <PersistedWatchItem>
-          <option name="expr" value="imu_service_pitch" />
+          <option name="expr" value="s_vqf" />
         </PersistedWatchItem>
         <PersistedWatchItem>
           <option name="expr" value="imu_service_yaw" />
         </PersistedWatchItem>
         <PersistedWatchItem>
-          <option name="expr" value="s_attitude" />
+          <option name="expr" value="imu_service_pitch" />
+        </PersistedWatchItem>
+        <PersistedWatchItem>
+          <option name="expr" value="imu_service_roll" />
         </PersistedWatchItem>
       </list>
     </option>

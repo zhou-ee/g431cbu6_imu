@@ -129,4 +129,38 @@ inline void quat_to_install(float q[4], const float m_inv[4])
     q[3] = aw * bz + ax * by - ay * bx + az * bw;
 }
 
+/* ============================================================================
+ * 反向映射（安装系 → 器件系，即 Mᵀ）
+ *
+ * 通信层把安装系的物理量反向恢复成器件原码时必须用它，**不能复用正向表**：
+ *   正向 out[j] = s[j]·in[p[j]]   （安装系第 j 轴取自器件系第 p[j] 轴）
+ *   反向 out[i] = s'[i]·in[q[i]]  （器件系第 i 轴取自安装系第 q[i] 轴，q = p⁻¹）
+ * DIRECT_2 / DIRECT_4 这类"换轴 + 非对称取反"的方向照搬正向表会算错。
+ * 本函数由正向表导出逆表，保证两者同源；初始化时算一次，热路径只查表。
+ * ========================================================================== */
+inline void mount_inverse_indices(imu_direct_t d, uint8_t idx[3], bool neg[3])
+{
+    uint8_t fwd_idx[3];
+    bool    fwd_neg[3];
+    mount_indices(d, fwd_idx, fwd_neg);
+    for (uint8_t j = 0U; j < 3U; ++j)
+    {
+        const uint8_t device_axis = fwd_idx[j]; /* 安装系 j ← 器件系 device_axis */
+        idx[device_axis] = j;                   /* 反向：器件系 i ← 安装系 j */
+        neg[device_axis] = fwd_neg[j];          /* 符号跟着来源轴走 */
+    }
+}
+
+/* 向量反向换系（热路径）：就地转成器件系。 */
+inline void mount_apply_inverse(float v[3], imu_direct_t d)
+{
+    uint8_t idx[3];
+    bool    neg[3];
+    mount_inverse_indices(d, idx, neg);
+    const float t[3] = { v[idx[0]], v[idx[1]], v[idx[2]] };
+    v[0] = neg[0] ? -t[0] : t[0];
+    v[1] = neg[1] ? -t[1] : t[1];
+    v[2] = neg[2] ? -t[2] : t[2];
+}
+
 #endif /* IMU_MOUNT_H */

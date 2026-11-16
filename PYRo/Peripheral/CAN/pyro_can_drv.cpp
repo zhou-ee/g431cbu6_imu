@@ -10,8 +10,8 @@ namespace
 constexpr uint32_t CAN_NOTIFY_FLAGS =
     FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_FULL |
     FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_ERROR_WARNING |
-    FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_BUS_OFF |
-    FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR;
+    FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_BUS_OFF;
+    /* 不开 ARB/DATA_PROTOCOL_ERROR：逐帧中断，台架无 ACK 时 3 帧/ms 各触发一次，实测把融合峰值从 791 µs 抬到 1157 µs，且无人消费。 */
 
 /* 撤销全部在发请求。**仅用于 BusOff 恢复**：此时发送队列已无意义，必须清空才能
  * 重新 Start。正常发送路径不得调用它——见 send_msg() 的说明。 */
@@ -170,6 +170,41 @@ pyro::status_t can_drv_t::start() const
         return pyro::PYRO_ERROR;
 
     return reactivate_can_notifications(_hfdcan);
+}
+
+/* 运行模式切换：internal loopback（TEST.LBCK）把 Tx 送回 Rx，硬件自答 ACK，
+ * 用于无对端的台架验证"编码 -> 驱动 -> 硬件 -> 接收"整条链路。
+ * 只能在没有在途帧的初始化阶段调用：HAL_FDCAN_Init 会重配消息 RAM/过滤器/通知，
+ * 因此这里直接复用 init()/start()。正常运行必须保持关闭。 */
+pyro::status_t can_drv_t::set_loopback(const bool enable) const
+{
+    if (nullptr == _hfdcan)
+        return pyro::PYRO_PARAM_ERROR;
+
+    _hfdcan->Init.Mode = enable ? FDCAN_MODE_INTERNAL_LOOPBACK : FDCAN_MODE_NORMAL;
+    (void)HAL_FDCAN_Stop(_hfdcan);
+    const pyro::status_t init_status = init();
+    if (pyro::PYRO_OK != init_status)
+        return init_status;
+    return start();
+}
+
+/* 轮询取一帧，不经过回调注册表。FIFO 空返回 PYRO_NOT_FOUND。
+ * 只有 init() 配置过过滤器后才会收到帧（过滤器为全通：ID 0 / 掩码 0）。 */
+pyro::status_t can_drv_t::poll_rx(uint32_t &id, uint8_t data[8]) const
+{
+    if (nullptr == _hfdcan || nullptr == data)
+        return pyro::PYRO_PARAM_ERROR;
+
+    if (0U == HAL_FDCAN_GetRxFifoFillLevel(_hfdcan, FDCAN_RX_FIFO0))
+        return pyro::PYRO_NOT_FOUND;
+
+    FDCAN_RxHeaderTypeDef header{};
+    if (HAL_OK != HAL_FDCAN_GetRxMessage(_hfdcan, FDCAN_RX_FIFO0, &header, data))
+        return pyro::PYRO_ERROR;
+
+    id = header.Identifier;
+    return pyro::PYRO_OK;
 }
 
 pyro::status_t can_drv_t::send_msg(const uint32_t id, const uint8_t *data) const

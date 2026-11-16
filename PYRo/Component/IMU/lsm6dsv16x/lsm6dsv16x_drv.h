@@ -44,6 +44,12 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
      * 样本由 assume_*_point() 消费归还；无返回值时代可看两路 count。 */
     bool read() override;
 
+    /* 解包参数（只读）：通信层反向恢复器件原码时按这些值换算，保证与正向解包
+     * 同源——量程切换后不必在别处再维护一份灵敏度表。
+     * acc 单位 m/s²/LSB，gyro 单位 rad/s/LSB（= dps_per_lsb × π/180）。 */
+    [[nodiscard]] float acc_mps2_per_lsb() const;
+    [[nodiscard]] float gyro_rps_per_lsb() const;
+
     /* 运行期诊断（只读）。err_bus/err_data/err_timeout 稳态都应恒为 0。 */
     struct diag_t {
         uint32_t err_bus;     /* 总线失败（状态读或帧读失败） */

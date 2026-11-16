@@ -56,6 +56,16 @@ bool gy_fs_code(uint16_t dps, uint8_t &code, float &dps_per_lsb);
 
 lsm6dsv16x_drv_t::~lsm6dsv16x_drv_t() = default;
 
+float lsm6dsv16x_drv_t::acc_mps2_per_lsb() const
+{
+    return (_acc_fs_g * GRAVITY) / 32768.0f;
+}
+
+float lsm6dsv16x_drv_t::gyro_rps_per_lsb() const
+{
+    return _gyro_dps_per_lsb * DEG_TO_RAD;
+}
+
 /**
  * @brief 初始化：WHO_AM_I 自检 → 软复位 → BDU/IF_INC → 满量程 → 模式+ODR
  *               → FIFO（fifo_en）→（可选）标定

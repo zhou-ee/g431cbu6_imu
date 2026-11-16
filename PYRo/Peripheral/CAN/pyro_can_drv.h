@@ -46,6 +46,13 @@ public:
     status_t init() const;
     status_t start() const;
 
+    /* 运行模式：internal loopback 用于无对端台架自测（详见 .cpp）。
+     * 必须在没有在途帧的初始化阶段调用。 */
+    status_t set_loopback(bool enable) const;
+
+    /* 轮询取一帧（不依赖回调注册）。FIFO 空返回 PYRO_NOT_FOUND。 */
+    status_t poll_rx(uint32_t &id, uint8_t data[8]) const;
+
     /* 提交一个经典 CAN 标准数据帧（固定 8 字节）。
      *
      * 契约：本函数**从不撤销已经入队的帧**。
