@@ -1,6 +1,7 @@
 # 六轴 VQF
 
-`pyro::vqf_t` 提供陀螺积分、加速度倾斜校正、静止检测和零偏估计。
+`pyro::vqf_t` 将 VQF 近惯性系加速度低通与六维全局误差状态 EKF（ESKF）结合，提供陀螺积分、加速度可信度评估、倾斜校正、静止检测和三轴零偏估计。
+这是本项目的定制融合实现，采用真实时间戳和固定存储。
 
 ## 公开接口
 
@@ -9,7 +10,7 @@
 | `configure(config)` | 首次初始化，以及运行中统一修改配置 |
 | `reset(bias, sigma)` | 重置全部状态，可指定初始零偏及标准差 |
 | `update(data)` | 接收 `const imu_data_t &`，按时间戳合并处理两路新样本 |
-| `get_state()` | 取得姿态、零偏、消费帧数、静止参考量和 KF 诊断的值快照 |
+| `get_state()` | 取得姿态、联合误差协方差、零偏、消费帧数、观测可信度及 KF 诊断的值快照 |
 
 配置由 `vqf_t::config_t` 保存，包含六轴融合参数。更新间隔由输入时间戳决定。
 成员注释标明单位。结果由 `vqf_t::state_t` 保存，内部低通与积分状态由实例管理。
@@ -52,7 +53,7 @@ pyro::status_t attitude_update(const imu_data_t &data)
 attitude.configure(config);
 
 // 驱动成功取到新数据后，直接交给 VQF。
-imu.update();
+imu.read();
 const auto status = attitude.update(imu.read_imu_data());
 const auto state = attitude.get_state();
 imu.assume_gyro_point(state.consumed_gyr);
@@ -91,10 +92,11 @@ VQF 通过 `state.consumed_gyr / state.consumed_acc` 报告最近一次 update �
 
 修改调用方持有的 config，再调用 `configure(config)`。
 参数更新保留当前姿态和零偏，降低 `bias_clip` 会立即对已有零偏限幅。
-`tau_acc` 变化保留低通输出和物理导数，实际更新周期变化时低通状态连续。
-静止判据变化重启静止检测，运动零偏开关变化重启相应观测低通。
+`tau_acc` 或可信度判据变化时清除加速度低通历史，重新确认可信观测，当前姿态继续传播。
+静止判据变化重启静止检测，运动零偏开关控制倾斜观测对零偏状态的修正。
 `bias_clip` 同时参与陀螺静止判据，修改时也会重启静止检测。
-`bias_sigma_init` 更新初始方差及过程噪声增长的参考上限，调用 `reset()` 时重新设置先验协方差。
+`bias_sigma_init` 和 `attitude_sigma_init` 在 `reset()` 时设置先验协方差。
+`bias_forgetting_time` 设置零偏随机游走强度，过程噪声在每个陀螺样本上按 dt 积分。
 
 `reset()` 恢复单位四元数、零偏零值及配置的初始不确定度。
 `reset(bias, sigma)` 可提供初始零偏，sigma=0 使用配置的初始不确定度。
@@ -108,14 +110,18 @@ VQF 通过 `state.consumed_gyr / state.consumed_acc` 报告最近一次 update �
 零加速度会中断连续静止计时。静止确认需要陀螺仪与加速度计两路判据均满足。
 其他错误结束批次，此前完成的样本及步骤保留。每次 update 开始时消费计数清零。
 非法输入帧在提交前被拒绝，消费前缀停在该帧之前，调用方可修复输入后继续。
-若加速度倾斜校正已经提交而后续 KF 失败，该加速度帧计入消费量，以避免重试时重复校正。
+加速度帧推进低通历史后计入消费量。后续 KF 或误差注入失败时保留此前名义姿态及该次修正前的协方差，避免重试同一帧时重复推进低通。
 WARNING 帧同样计入消费量，批次继续处理后续样本。
-通过 `state.initialized` 和 `state.bias_diagnostics` 读取初始化状态及最近 KF 操作结果。
+`state.initialized` 表示已完成可信重力方向初始化，启动默认连续确认 0.2 s。
+`state.bias_diagnostics` 保留字段名，内容为最近一次联合误差滤波操作的诊断。
+`state.acc_confidence / acc_nis / acc_rejected` 分别为最近样本可信度、最近倾斜观测 NIS、门控或恢复等待标记。
+`state.acc_corrections / acc_rejections` 为实际倾斜观测提交数、受门控或恢复等待的加速度帧数。
 同一实例的配置、更新与读取由调用方同步。
 
 ## 算法依赖
 
-零偏估计使用现有 `kf_t<3,3>`，沿用 Cholesky 求解和 Joseph 协方差更新。
+ESKF 使用现有 `kf_t<6,3,true>` 计算线性化误差状态，采用 Cholesky 求解、Joseph 协方差更新和数值检查。
+名义四元数使用非线性旋转传播，观测模型在当前名义状态处线性化。
 矩阵使用 PYRo Matrix，四元数运算使用 CMSIS-DSP。
 `Algorithm/Butterworth` 独立提供 `configure / reset / process` 三个入口，
 低通使用二阶连续 Butterworth 的状态转移，区间内输入按当前样本保持。
@@ -125,13 +131,69 @@ WARNING 帧同样计入消费量，批次继续处理后续样本。
 低通系数和递推状态采用 double，输入输出采用 float。
 所有模块使用固定存储。VQF 算法版权及 MIT 许可保留在本目录。
 
+## 联合估计与观测门控
+
+名义状态为四元数和三轴陀螺零偏。误差顺序为 `[δθ_global, δb_body]`，定义为 `R_true = Exp(δθ) R_nom`。
+连续误差模型为 `δθ_dot = -R_nom δb - R_nom n_g`，`δb_dot = n_b`。
+恒角速度区间使用 `R_start J_l(ω dt)` 作为平均旋转计算偏置耦合，偏置随机游走噪声采用该平均旋转的近似积分。
+倾斜观测取朝向 +Z 的最短旋转向量的水平两维，NIS 门限按两维设置。
+每次修正通过调整后的增益一起更新状态和 Joseph 协方差，随后向名义状态注入误差，并用 SO(3) 左雅可比重置误差协方差。
+`error_covariance` 的前 3 维单位为 rad，后 3 维为 rad/s，交叉项单位为二者乘积。
+
+加速度进入倾斜低通前，使用模长偏差、近惯性系高频残差能量和预测倾斜不确定度进行检查。
+50 ms 一阶能量窗口跟踪高频扰动。预检查拒绝样本时清空倾斜低通历史，重新等待连续可信数据。
+接受的低通观测根据可信度增大 R，使用两维 NIS 进一步门控。
+为限制相邻低通样本重复提供的信息，R 乘以 `max(1, tau_acc / observation_interval)`。
+静止陀螺观测对应使用 `max(1, 2 * rest_filter_tau / observation_interval)`。
+上述相关时间缩放是保守的工程近似，包含陀螺积分误差的滤波观测统计需要通过标定和回放进一步验证。
+
+陀螺按全部样本传播，倾斜和静止观测按 `acc_update_period` 限制频率，观测间隔使用实际累积时间。
+`motion_bias_est_enabled` 允许可信倾斜观测同时修正零偏，静止阶段使用低通角速度观测。
+当前产品已启用运动零偏估计，ESKF 观测最小间隔为 2 ms。1920 Hz 名义采样下按四个样本对齐，约为 480 Hz，实际频率由时间戳及门控状态决定。
+
+| 新增参数 | 默认值 | 用途 |
+|---|---|---|
+| `attitude_sigma_init` | 30 ° | 初始姿态误差标准差，重力对齐后保留航向不确定度 |
+| `gyro_noise_density` | 0.05 °/s/√Hz | 陀螺白噪声密度 |
+| `acc_noise` | 0.3 m/s² | 加速度单轴噪声标准差，用于方向噪声和预检查 |
+| `acc_norm_tolerance` | 1.0 m/s² | 模长偏差降权尺度，超过三倍时拒绝 |
+| `acc_vibration_tolerance` | 1.0 m/s² | 近惯性系高频残差 RMS 降权尺度 |
+| `acc_update_period` | 0.002 s | ESKF 观测最小间隔 |
+| `acc_recovery_t` | 0.2 s | 启动和受扰后的可信确认时间 |
+| `acc_nis_threshold` | 9.21034 | χ²(2) 的名义 99% 分位值 |
+
+原 `bias_sigma_motion` 和 `bias_vertical_forgetting_factor` 随原三状态运动零偏观测模型一并移除。
+新模型的运动零偏收敛由联合协方差、陀螺/偏置过程噪声、加速度观测噪声和可信度共同决定。
+这些默认值为工程初始值，目标硬件噪声及振动条件的回放用于确定最终参数。
+
 ## 联调检查
 
-demo 通过 `vqf_test_imu_bus_err / vqf_test_imu_data_err` 观察总线失败、FIFO 溢出和样本缓冲覆盖，
-通过 `vqf_test_update_us_max` 观察解算耗时。未及时消费时，24 帧环形缓冲会覆盖最旧样本并计数。
-时间戳可以提供丢帧区间的时长，区间运动仍按当前角速度样本保持来近似。
-异频批次应按共同时间轴提交，已经提交较新陀螺帧后到达的旧加速度帧缺少历史姿态补偿。
-可变步长低通在 dt 变化时重新计算系数，高采样率实时性须通过实际硬件测量。
+产品通过 `imu_service_err_bus / imu_service_err_data / imu_service_err_timeout` 观察采集异常，
+通过 `imu_service_vqf_us_max` 观察单批解算耗时。
+`imu_service_acc_confidence / imu_service_acc_nis / imu_service_acc_rejected` 用于观察降权、门控和恢复等待。
+`imu_service_attitude().valid` 在可信重力方向确认后置位。
+未及时消费时，24 帧环形缓冲会覆盖最旧样本并计数。
+时间戳提供丢帧区间的时长，区间运动按当前角速度样本保持来近似。
+异频批次按共同时间轴提交，已经提交较新陀螺帧后到达的旧加速度帧需要由上层重新建立共同批次。
+可变步长低通在 dt 改变时重新计算系数，高采样率实时性通过硬件测量确认。
 
-IMU 标定使用传感器原坐标系的未扣偏置样本，结束后恢复安装方向。
-标定失败恢复原偏置和安装方向。标定期间会清除并消费两路待处理样本。
+纯六轴的绝对航向需要外部方向参考，持续单向加速的进一步分离需要运动约束或外部观测。
+饱和与混叠在量程、采样及器件前端滤波层处理。
+
+## 主机回放回归
+
+在仓库根目录执行，需要 Python 3 与本机 gcc/g++，使用仓库内 CMSIS-DSP 标量实现，产物写入临时目录。
+
+```sh
+python PYRo/tests/run_vqf_eskf.py
+```
+
+覆盖平移加速、振动、冲击、倒置初始化、真实三轴转动、静止/运动零偏、带噪声动态、异频流、环形批次、时间戳回绕、非法参数及数值失败回滚。
+可通过 `--baseline-dir` 指定保存旧版 `pyro_algo_vqf.h/.cpp` 的目录，运行相同的三项干扰回放作对比。
+合成回放使用已知四元数轨迹生成理想传感器输入，并叠加给定噪声及扰动。真实硬件误差、时间同步及 CPU 最坏耗时由上板验证补充。
+
+## 模型参考
+
+近惯性系加速度预处理和静止检测参考 VQF，保留原版权及许可。[VQF 论文](https://arxiv.org/abs/2203.17024)
+
+全局姿态误差动力学、误差注入和协方差重置采用 SO(3) 误差状态表达。[Quaternion kinematics for the error-state Kalman filter](https://arxiv.org/abs/1711.02508)

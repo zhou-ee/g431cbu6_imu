@@ -19,7 +19,7 @@
 #include "pyro_core_def.h"
 
 /* 姿态结果快照。四元数顺序 [w,x,y,z]，表示传感器安装坐标系到 Z-up 参考系。
- * valid=false 表示 VQF 尚未产生有效姿态，此时四元数为单位四元数。 */
+ * valid=false 表示等待可信重力方向初始化。 */
 struct imu_attitude_t
 {
     float quat[4];     /* [w,x,y,z] */
@@ -29,7 +29,7 @@ struct imu_attitude_t
     float yaw;         /* ° */
     float rest_t;      /* 连续静止计时，s */
     bool  rest;        /* 当前判定为静止 */
-    bool  valid;       /* VQF 已配置且至少完成一次更新 */
+    bool  valid;       /* VQF 已完成可信重力方向初始化 */
 };
 
 /* 启动采集链路：初始化器件与 VQF，创建常驻任务。
@@ -74,6 +74,9 @@ extern volatile float    imu_service_yaw;           /* ° */
 extern volatile float    imu_service_bias_rps[3];   /* 零偏估计，rad/s */
 extern volatile uint32_t imu_service_rest;          /* 1=当前静止 */
 extern volatile float    imu_service_rest_t;        /* 静止计时，s */
+extern volatile float    imu_service_acc_confidence; /* 加速度可信度，0..1 */
+extern volatile float    imu_service_acc_nis;        /* 最近两维倾斜观测 NIS */
+extern volatile uint32_t imu_service_acc_rejected;   /* 1=最近加速度受到门控/恢复等待 */
 }
 
 #endif

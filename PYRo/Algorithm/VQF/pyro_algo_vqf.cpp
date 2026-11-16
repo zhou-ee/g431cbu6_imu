@@ -13,17 +13,19 @@ namespace pyro
 namespace
 {
 constexpr float deg_to_rad = 0.01745329251994329577f;
+constexpr float gravity = 9.80665f;
+constexpr float vibration_tau = 0.05f;
+constexpr float min_acc_confidence = 0.2f;
+constexpr float max_correction_angle = 0.1f;
 
 float square(float value) { return value * value; }
 
 float norm(const vector_t<3> &value)
 {
-    // sqrtf（float 版）：避免链接 double 版 __ieee754_sqrt
     return sqrtf(square(value[0]) + square(value[1]) + square(value[2]));
 }
 
-vqf_t::quaternion_t multiply(const vqf_t::quaternion_t &a,
-                              const vqf_t::quaternion_t &b)
+vqf_t::quaternion_t multiply(const vqf_t::quaternion_t &a, const vqf_t::quaternion_t &b)
 {
     vqf_t::quaternion_t result;
     arm_quaternion_product_single_f32(a.data(), b.data(), result.data());
@@ -44,23 +46,62 @@ matrix_t<3, 3> rotation(const vqf_t::quaternion_t &q)
     return result;
 }
 
-// v' = q * v * q⁻¹，直接旋转向量以省去中间旋转矩阵。
 vector_t<3> rotate(const vqf_t::quaternion_t &q, const vector_t<3> &v)
 {
     const float w = q[0], x = q[1], y = q[2], z = q[3];
-    // t = 2 * (q_vec × v)
     const float tx = 2.0f * (y * v[2] - z * v[1]);
     const float ty = 2.0f * (z * v[0] - x * v[2]);
     const float tz = 2.0f * (x * v[1] - y * v[0]);
-    // v' = v + w * t + q_vec × t
-    return {v[0] + w * tx + (y * tz - z * ty),
-            v[1] + w * ty + (z * tx - x * tz),
-            v[2] + w * tz + (x * ty - y * tx)};
+    return {v[0] + w * tx + y * tz - z * ty,
+            v[1] + w * ty + z * tx - x * tz,
+            v[2] + w * tz + x * ty - y * tx};
 }
 
-matrix_t<3, 3> identity(float scale = 1.0f)
+template <std::size_t N> matrix_t<N, N> identity(float scale = 1.0f)
 {
-    return {scale, 0.0f, 0.0f, 0.0f, scale, 0.0f, 0.0f, 0.0f, scale};
+    matrix_t<N, N> result;
+    for (std::size_t i = 0; i < N; ++i)
+        result(i, i) = scale;
+    return result;
+}
+
+vqf_t::quaternion_t rotation_step(const vector_t<3> &angle)
+{
+    const float magnitude = norm(angle);
+    if (magnitude < 1.0e-6f)
+        return normalized({1.0f, 0.5f * angle[0], 0.5f * angle[1], 0.5f * angle[2]});
+    const float scale = sinf(0.5f * magnitude) / magnitude;
+    return {cosf(0.5f * magnitude), scale * angle[0], scale * angle[1], scale * angle[2]};
+}
+
+// SO(3) 左雅可比，用于旋转积分及全局误差注入后的协方差重置。
+// J_l(v)=I+(1-cos|v|)/|v|²[v]x+(|v|-sin|v|)/|v|³[v]x²。
+matrix_t<3, 3> left_jacobian(const vector_t<3> &angle)
+{
+    const float squared = square(angle[0]) + square(angle[1]) + square(angle[2]);
+    float first = 0.5f - squared / 24.0f;
+    float second = 1.0f / 6.0f - squared / 120.0f;
+    if (squared > 1.0e-4f)
+    {
+        const float magnitude = sqrtf(squared);
+        first = (1.0f - cosf(magnitude)) / squared;
+        second = (magnitude - sinf(magnitude)) / (squared * magnitude);
+    }
+    const matrix_t<3, 3> skew{0.0f, -angle[2], angle[1],
+                              angle[2], 0.0f, -angle[0],
+                              -angle[1], angle[0], 0.0f};
+    return identity<3>() + skew * first + (skew * skew) * second;
+}
+
+// 将单位方向转向 +Z 的最短旋转向量，取水平两维作为倾斜新息。
+vector_t<3> inclination_error(const vector_t<3> &direction)
+{
+    const float horizontal = sqrtf(square(direction[0]) + square(direction[1]));
+    const float angle = atan2f(horizontal, direction[2]);
+    if (horizontal < 1.0e-6f)
+        return direction[2] < 0.0f ? vector_t<3>{3.14159265358979323846f, 0.0f, 0.0f}
+                                   : vector_t<3>{direction[1], -direction[0], 0.0f};
+    return {angle * direction[1] / horizontal, -angle * direction[0] / horizontal, 0.0f};
 }
 
 template <typename Sample> bool valid_stream(const sample_stream_t<Sample> &stream)
@@ -72,67 +113,58 @@ template <typename Sample> bool valid_stream(const sample_stream_t<Sample> &stre
 
 status_t vqf_t::configure(const config_t &config)
 {
-    config_t next = config;
     const float positive[] = {
-        next.tau_acc, next.bias_sigma_init,
-        next.bias_forgetting_time, next.bias_clip, next.bias_sigma_motion,
-        next.bias_sigma_rest, next.rest_filter_tau, next.rest_th_gyr, next.rest_th_acc};
+        config.tau_acc, config.bias_sigma_init, config.bias_forgetting_time,
+        config.bias_clip, config.bias_sigma_rest, config.rest_filter_tau,
+        config.rest_th_gyr, config.rest_th_acc, config.attitude_sigma_init,
+        config.gyro_noise_density, config.acc_noise, config.acc_norm_tolerance,
+        config.acc_vibration_tolerance, config.acc_update_period, config.acc_nis_threshold};
     for (float value : positive)
-        if (!std::isfinite(value) || value <= 0.0f)
+        if (!matrix::is_finite(value) || value <= 0.0f ||
+            !matrix::is_finite(square(value)) || square(value) == 0.0f)
             return PYRO_PARAM_ERROR;
-    if (!std::isfinite(next.rest_min_t) || next.rest_min_t < 0.0f ||
-        !std::isfinite(next.bias_vertical_forgetting_factor) ||
-        next.bias_vertical_forgetting_factor < 0.0f)
+    if (!matrix::is_finite(config.rest_min_t) || config.rest_min_t < 0.0f ||
+        !matrix::is_finite(config.acc_recovery_t) || config.acc_recovery_t < 0.0f)
         return PYRO_PARAM_ERROR;
-
-    // 协方差统一为 (rad/s)²，统一缩放保持原版 Kalman 增益。
-    // SI covariance units preserve the original gain under common scaling.
-    // 全 float 计算：只为求平方，用 x*x 代替 std::pow(x,2)，
-    // 避免把 double 版 __ieee754_pow（约 3 KB）拉进固件。
-    const float radians = deg_to_rad;
-    const float variance_rate = (0.1f * radians) * (0.1f * radians) /
-                           next.bias_forgetting_time;
-    const float motion_p = (next.bias_sigma_motion * radians) *
-                           (next.bias_sigma_motion * radians);
-    const float rest_p = (next.bias_sigma_rest * radians) *
-                         (next.bias_sigma_rest * radians);
-    coefficients_t coeffs;
-    coeffs.bias_p0 = square(next.bias_sigma_init * deg_to_rad);
-    coeffs.bias_variance_rate = variance_rate;
-    coeffs.bias_motion_p = motion_p;
-    coeffs.bias_rest_p = rest_p;
     const float derived[] = {
-        coeffs.bias_p0, coeffs.bias_variance_rate,
-        coeffs.bias_motion_p, coeffs.bias_rest_p,
-        next.bias_clip * deg_to_rad, next.rest_th_gyr * deg_to_rad};
+        square(config.bias_sigma_init * deg_to_rad),
+        square(config.attitude_sigma_init * deg_to_rad),
+        square(config.gyro_noise_density * deg_to_rad),
+        square(config.bias_sigma_rest * deg_to_rad),
+        square(0.1f * deg_to_rad) / config.bias_forgetting_time,
+        square(config.acc_noise / gravity)};
     for (float value : derived)
-        if (!std::isfinite(value) || value <= 0.0f)
+        if (!matrix::is_finite(value) || value <= 0.0f)
             return PYRO_PARAM_ERROR;
 
-    const bool first = !_bias_kf.is_initialized();
+    const bool first = !_error_kf.is_initialized();
     if (first)
     {
-        const status_t result = _bias_kf.init({}, identity(coeffs.bias_p0));
+        error_kf_t::covariance_t P;
+        for (std::size_t i = 0; i < 3; ++i)
+        {
+            P(i, i) = derived[1];
+            P(i + 3, i + 3) = derived[0];
+        }
+        error_kf_t::options_t options;
+        for (std::size_t i = 0; i < 3; ++i)
+        {
+            options.min_variance[i] = 1.0e-12f;
+            options.min_variance[i + 3] = 1.0e-14f;
+        }
+        const status_t result = _error_kf.init({}, P, options);
         if (result != PYRO_OK)
             return result;
     }
-    const bool motion_changed = next.motion_bias_est_enabled != _config.motion_bias_est_enabled;
-    const bool rest_changed = next.rest_bias_est_enabled != _config.rest_bias_est_enabled ||
-        next.rest_filter_tau != _config.rest_filter_tau ||
-        next.rest_min_t != _config.rest_min_t ||
-        next.rest_th_gyr != _config.rest_th_gyr || next.rest_th_acc != _config.rest_th_acc ||
-        next.bias_clip != _config.bias_clip;
-
-    _acc_lp.configure(next.tau_acc);
-    _rest_gyr_lp.configure(next.rest_filter_tau);
-    _rest_acc_lp.configure(next.rest_filter_tau);
-    _motion_rotation_lp.configure(next.tau_acc);
-    _motion_bias_lp.configure(next.tau_acc);
-    if (motion_changed)
-    {
-        _motion_rotation_lp.reset();
-        _motion_bias_lp.reset();
-    }
+    const bool rest_changed = config.rest_bias_est_enabled != _config.rest_bias_est_enabled ||
+        config.rest_filter_tau != _config.rest_filter_tau || config.rest_min_t != _config.rest_min_t ||
+        config.rest_th_gyr != _config.rest_th_gyr || config.rest_th_acc != _config.rest_th_acc ||
+        config.bias_clip != _config.bias_clip;
+    const bool acc_changed = config.tau_acc != _config.tau_acc ||
+        config.acc_noise != _config.acc_noise || config.acc_norm_tolerance != _config.acc_norm_tolerance ||
+        config.acc_vibration_tolerance != _config.acc_vibration_tolerance ||
+        config.acc_recovery_t != _config.acc_recovery_t ||
+        config.acc_nis_threshold != _config.acc_nis_threshold;
     if (rest_changed)
     {
         _rest_gyr_lp.reset();
@@ -140,50 +172,61 @@ status_t vqf_t::configure(const config_t &config)
         _state.rest_gyr_lp = {};
         _state.rest_acc_lp = {};
         _state.rest_t = 0.0f;
-        _state.rest_gyr_ok = false;
-        _state.rest_detected = false;
+        _state.rest_gyr_ok = _state.rest_detected = false;
     }
-    _config = next;
-    _coeffs = coeffs;
-    _bias_dt = 0.0f;
+    if (acc_changed)
+    {
+        _state.trusted_acc_t = _state.observation_t = 0.0f;
+        _acc_lp.reset();
+    }
+    (void)_acc_lp.configure(config.tau_acc);
+    (void)_rest_gyr_lp.configure(config.rest_filter_tau);
+    (void)_rest_acc_lp.configure(config.rest_filter_tau);
+    _config = config;
     if (first)
         return reset();
-
-    vector3_t bias = _bias_kf.get_state();
     const float clip = _config.bias_clip * deg_to_rad;
-    for (float &value : bias)
+    for (float &value : _state.bias)
         value = std::clamp(value, -clip, clip);
-    if (bias != _bias_kf.get_state())
-        return _bias_kf.reset(bias, _bias_kf.get_covariance());
     return PYRO_OK;
 }
 
 status_t vqf_t::reset(const vector3_t &bias, float sigma)
 {
-    if (!_bias_kf.is_initialized())
+    if (!_error_kf.is_initialized())
         return PYRO_NOT_FOUND;
-    if (!matrix::is_finite(bias) || !std::isfinite(sigma) || sigma < 0.0f ||
-        !std::isfinite(square(sigma)))
+    if (!matrix::is_finite(bias) || !matrix::is_finite(sigma) || sigma < 0.0f ||
+        !matrix::is_finite(square(sigma)))
         return PYRO_PARAM_ERROR;
     const float clip = _config.bias_clip * deg_to_rad;
     for (float value : bias)
         if (std::fabs(value) > clip)
             return PYRO_PARAM_ERROR;
+    error_kf_t::covariance_t P;
+    for (std::size_t i = 0; i < 3; ++i)
+    {
+        P(i, i) = square(_config.attitude_sigma_init * deg_to_rad);
+        P(i + 3, i + 3) = sigma > 0.0f ? square(sigma) : square(_config.bias_sigma_init * deg_to_rad);
+    }
+    const status_t result = _error_kf.reset({}, P);
+    if (result != PYRO_OK)
+        return result;
     _state = {};
-    _bias_dt = 0.0f;
+    _state.bias = bias;
+    _diagnostics = {};
     _acc_lp.reset();
     _rest_gyr_lp.reset();
     _rest_acc_lp.reset();
-    _motion_rotation_lp.reset();
-    _motion_bias_lp.reset();
-    return _bias_kf.reset(bias, identity(sigma > 0.0f ? square(sigma) : _coeffs.bias_p0));
+    err_stage = 0U;
+    return PYRO_OK;
 }
 
 status_t vqf_t::update(const imu_data_t &data)
 {
+    err_stage = 0U;
     _state.consumed_gyr = 0;
     _state.consumed_acc = 0;
-    if (!_bias_kf.is_initialized())
+    if (!_error_kf.is_initialized())
         return PYRO_NOT_FOUND;
     if (!valid_stream(data.gyro) || !valid_stream(data.acc))
     {
@@ -251,12 +294,6 @@ status_t vqf_t::update(const imu_data_t &data)
                 return PYRO_PARAM_ERROR;
             if (!duplicate)
             {
-                if (dt > 0.0f && (_config.motion_bias_est_enabled || _config.rest_bias_est_enabled))
-                {
-                    result = _prepare_bias(dt);
-                    if (result != PYRO_OK)
-                        return result;
-                }
                 result = _update_acc(acc, dt);
             }
             ++acc_index;
@@ -273,20 +310,45 @@ status_t vqf_t::update(const imu_data_t &data)
 
 status_t vqf_t::_update_gyr(const vector3_t &gyr, float dt)
 {
-    const vector3_t unbiased = gyr - _bias_kf.get_state();
-    const float rate = norm(unbiased);
-    if (!std::isfinite(rate) ||
-        !std::isfinite(rate * dt))
+    const vector3_t unbiased = gyr - _state.bias;
+    const vector3_t angle = unbiased * dt;
+    if (!matrix::is_finite(norm(unbiased)) || !matrix::is_finite(norm(angle)))
         return PYRO_PARAM_ERROR;
-
+    if (dt > 0.0f)
+    {
+        const quaternion_t next_gyr = normalized(multiply(_state.gyr_quat, rotation_step(angle)));
+        // R_true=Exp(δθ_global)R_nom，δθ_dot=-R_nom δb-R_nom n_g。
+        // 平均旋转 A=R_start J_l(ω dt)，对恒角速度积分偏置耦合。
+        const auto A = rotation(multiply(_state.acc_quat, _state.gyr_quat)) * left_jacobian(angle);
+        const auto AAt = A * A.transpose();
+        auto F = identity<6>();
+        error_kf_t::covariance_t Q;
+        const float bias_rate = square(0.1f * deg_to_rad) / _config.bias_forgetting_time;
+        const float gyro_variance = square(_config.gyro_noise_density * deg_to_rad) * dt;
+        const float bias_variance = bias_rate * dt;
+        for (std::size_t row = 0; row < 3; ++row)
+        {
+            Q(row, row) = gyro_variance;
+            Q(row + 3, row + 3) = bias_variance;
+            for (std::size_t col = 0; col < 3; ++col)
+            {
+                F(row, col + 3) = -A(row, col) * dt;
+                Q(row, col) += AAt(row, col) * bias_variance * square(dt) / 3.0f;
+                Q(row, col + 3) = Q(col + 3, row) = -0.5f * A(row, col) * bias_variance * dt;
+            }
+        }
+        const status_t result = _error_kf.predict({}, F, Q);
+        _diagnostics = _error_kf.get_diagnostics();
+        if (result != PYRO_OK)
+            return result;
+        _state.gyr_quat = next_gyr;
+    }
     if (_config.rest_bias_est_enabled)
     {
-        _rest_gyr_lp.process(gyr.data(), _state.rest_gyr_lp.data(), dt);
+        (void)_rest_gyr_lp.process(gyr.data(), _state.rest_gyr_lp.data(), dt);
         const vector3_t deviation = gyr - _state.rest_gyr_lp;
-        const float squared_deviation = square(deviation[0]) +
-            square(deviation[1]) + square(deviation[2]);
         const float clip = _config.bias_clip * deg_to_rad;
-        _state.rest_gyr_ok = squared_deviation < square(_config.rest_th_gyr * deg_to_rad) &&
+        _state.rest_gyr_ok = norm(deviation) < _config.rest_th_gyr * deg_to_rad &&
             std::fabs(_state.rest_gyr_lp[0]) <= clip &&
             std::fabs(_state.rest_gyr_lp[1]) <= clip &&
             std::fabs(_state.rest_gyr_lp[2]) <= clip;
@@ -296,179 +358,289 @@ status_t vqf_t::_update_gyr(const vector3_t &gyr, float dt)
             _state.rest_detected = false;
         }
     }
-
-    if (dt > 0.0f && rate > std::numeric_limits<float>::epsilon())
-    {
-        const float half_angle = 0.5f * rate * dt;
-        const float scale = std::sin(half_angle) / rate;
-        const quaternion_t step{std::cos(half_angle), scale * unbiased[0],
-                                 scale * unbiased[1], scale * unbiased[2]};
-        _state.gyr_quat = normalized(multiply(_state.gyr_quat, step));
-    }
     return PYRO_OK;
+}
+
+void vqf_t::_reject_acc()
+{
+    _state.acc_rejected = true;
+    ++_state.acc_rejections;
+    _state.trusted_acc_t = _state.observation_t = 0.0f;
+    _state.rest_t = 0.0f;
+    _state.rest_detected = false;
+    // 恢复时重新积累可信历史，冲击样本的低通尾迹在此清除。
+    _acc_lp.reset();
 }
 
 status_t vqf_t::_update_acc(const vector3_t &acc, float dt)
 {
-    if (acc[0] == 0.0f && acc[1] == 0.0f && acc[2] == 0.0f)
+    const float magnitude = norm(acc);
+    _state.acc_confidence = 0.0f;
+    if (magnitude <= std::numeric_limits<float>::min())
     {
-        _state.rest_t = 0.0f;
-        _state.rest_detected = false;
+        _reject_acc();
         return PYRO_WARNING;
     }
-
+    const float norm_error = std::fabs(magnitude - gravity);
+    if (norm_error > 3.0f * _config.acc_norm_tolerance)
+    {
+        _reject_acc();
+        return PYRO_WARNING;
+    }
+    const vector3_t acc_inertial = rotate(_state.gyr_quat, acc);
+    if (!_state.reference_initialized)
+    {
+        _state.acc_reference = acc_inertial;
+        _state.reference_initialized = true;
+    }
+    // 50 ms 能量窗口在近惯性系评估，真实转动导致的重力投影变化已补偿。
+    const float gain = dt / (vibration_tau + dt);
+    const vector3_t highpass = acc_inertial - _state.acc_reference;
+    const float energy = square(highpass[0]) + square(highpass[1]) + square(highpass[2]);
+    const float next_variance = _state.vibration_variance + gain * (energy - _state.vibration_variance);
+    if (!matrix::is_finite(energy) || !matrix::is_finite(next_variance))
+    {
+        _state.reference_initialized = false;
+        _state.vibration_variance = 0.0f;
+        _reject_acc();
+        return PYRO_WARNING;
+    }
+    _state.acc_reference += highpass * gain;
+    _state.vibration_variance = next_variance;
+    float confidence = 1.0f / (1.0f + square(norm_error / _config.acc_norm_tolerance) +
+        _state.vibration_variance / square(_config.acc_vibration_tolerance));
+    bool direction_rejected = false;
+    if (_state.tilt_initialized)
+    {
+        const auto raw_direction = rotate(_state.acc_quat, acc_inertial / magnitude);
+        const auto raw_error = inclination_error(raw_direction);
+        const auto &P = _error_kf.get_covariance();
+        const float variance = P(0, 0) + P(1, 1) + 2.0f * square(_config.acc_noise / magnitude);
+        const float normalized_error = (square(raw_error[0]) + square(raw_error[1])) / variance;
+        confidence /= 1.0f + normalized_error / _config.acc_nis_threshold;
+        direction_rejected = normalized_error > _config.acc_nis_threshold;
+    }
+    _state.acc_confidence = std::clamp(confidence, 0.0f, 1.0f);
+    if (!matrix::is_finite(confidence) ||
+        confidence < min_acc_confidence || direction_rejected)
+    {
+        _reject_acc();
+        return PYRO_WARNING;
+    }
+    _state.acc_rejected = false;
     if (_config.rest_bias_est_enabled)
     {
-        _rest_acc_lp.process(acc.data(), _state.rest_acc_lp.data(), dt);
-        const vector3_t deviation = acc - _state.rest_acc_lp;
-        const float squared_deviation = square(deviation[0]) +
-            square(deviation[1]) + square(deviation[2]);
-        if (!_state.rest_gyr_ok || squared_deviation >= square(_config.rest_th_acc))
-        {
-            _state.rest_t = 0.0f;
-            _state.rest_detected = false;
-        }
-        else
+        (void)_rest_acc_lp.process(acc.data(), _state.rest_acc_lp.data(), dt);
+        const auto deviation = acc - _state.rest_acc_lp;
+        if (_state.rest_gyr_ok && norm(deviation) < _config.rest_th_acc &&
+            norm_error < _config.rest_th_acc)
         {
             _state.rest_t += dt;
             _state.rest_detected = _state.rest_t >= _config.rest_min_t;
         }
+        else
+        {
+            _state.rest_t = 0.0f;
+            _state.rest_detected = false;
+        }
     }
-
-    // 两处旋转都只用到向量结果，直接按四元数旋转，不构造 3x3 矩阵
-    const vector_t<3> acc_inertial = rotate(_state.gyr_quat, acc);
-    _acc_lp.process(acc_inertial.data(), _state.last_acc_lp.data(), dt);
-    vector_t<3> acc_earth = rotate(_state.acc_quat, _state.last_acc_lp);
-    const float earth_magnitude = norm(acc_earth);
-    if (!std::isfinite(earth_magnitude) ||
-        earth_magnitude <= std::numeric_limits<float>::min())
-        return PYRO_WARNING;
-    acc_earth /= earth_magnitude;
-
-    const float z = std::clamp(acc_earth[2], -1.0f, 1.0f);
-    const float qw = sqrtf(0.5f * (z + 1.0f));
-    quaternion_t correction{0.0f, 1.0f, 0.0f, 0.0f};
-    if (qw > 1.0e-6f)
-        correction = {qw, 0.5f * acc_earth[1] / qw,
-                       -0.5f * acc_earth[0] / qw, 0.0f};
-    _state.acc_quat = normalized(multiply(correction, _state.acc_quat));
-
-    if (_config.motion_bias_est_enabled || _config.rest_bias_est_enabled)
-        return _update_bias(acc_earth, dt);
-    return PYRO_OK;
-}
-
-status_t vqf_t::_prepare_bias(float dt)
-{
-    if (dt == _bias_dt)
-        return PYRO_OK;
-    bias_noise_t noise;
-    noise.variance = _coeffs.bias_variance_rate * dt;
-    if (!std::isfinite(noise.variance) || noise.variance <= 0.0f)
-        return PYRO_PARAM_ERROR;
-    const float motion_p = _coeffs.bias_motion_p;
-    const float rest_p = _coeffs.bias_rest_p;
-    noise.motion = motion_p * (motion_p / noise.variance + 1.0f);
-    noise.vertical = noise.motion / std::max(_config.bias_vertical_forgetting_factor, 1.0e-10f);
-    noise.rest = rest_p * (rest_p / noise.variance + 1.0f);
-    if (!std::isfinite(noise.motion) || !std::isfinite(noise.vertical) || !std::isfinite(noise.rest))
-        return PYRO_PARAM_ERROR;
-    _bias_noise = noise;
-    _bias_dt = dt;
-    return PYRO_OK;
-}
-
-status_t vqf_t::_update_bias(const vector3_t &acc_earth, float dt)
-{
-    matrix_t<3, 3> H;
-    vector_t<2> bias_lp;
-    if (_config.motion_bias_est_enabled)
+    (void)_acc_lp.process(acc_inertial.data(), _state.last_acc_lp.data(), dt);
+    _state.trusted_acc_t += dt;
+    _state.observation_t += dt;
+    if (_state.trusted_acc_t < _config.acc_recovery_t)
     {
-        H = rotation(multiply(_state.acc_quat, _state.gyr_quat));
-        const vector3_t rotated_bias = H * _bias_kf.get_state();
-        bias_lp = {rotated_bias[0], rotated_bias[1]};
-        _motion_rotation_lp.process(H.data(), H.data(), dt);
-        _motion_bias_lp.process(bias_lp.data(), bias_lp.data(), dt);
+        _state.acc_rejected = true;
+        ++_state.acc_rejections;
+        return PYRO_WARNING;
     }
-    if (dt == 0.0f)
+    if (!_state.tilt_initialized)
+        return _initialize_tilt();
+    if (_state.observation_t < _config.acc_update_period)
         return PYRO_OK;
-
-    // 零偏为随机游走，F=I；达到初始不确定度后停止增加对角方差。
-    // Random-walk bias, F=I; stop increasing each diagonal at initial variance.
-    bias_kf_t::covariance_t Q;
-    const auto &P = _bias_kf.get_covariance();
-    for (std::size_t i = 0; i < 3; ++i)
-        if (P(i, i) < _coeffs.bias_p0)
-            Q(i, i) = _bias_noise.variance;
-    status_t result = _bias_kf.predict(_bias_kf.get_state(), identity(), Q);
+    const float interval = _state.observation_t;
+    _state.observation_t = 0.0f;
+    const status_t result = _correct_acc(interval);
+    if (result == PYRO_WARNING)
+        _reject_acc();
     if (result != PYRO_OK)
         return result;
-
-    vector3_t residual;
-    bias_kf_t::measurement_noise_t W;
     if (_state.rest_detected && _config.rest_bias_est_enabled)
-    {
-        H = identity();
-        residual = _state.rest_gyr_lp - _bias_kf.get_state();
-        W = identity(_bias_noise.rest);
-    }
-    else if (_config.motion_bias_est_enabled)
-    {
-        residual = vector3_t{-acc_earth[1] / dt + bias_lp[0],
-                               acc_earth[0] / dt + bias_lp[1], 0.0f} -
-                   H * _bias_kf.get_state();
-        W(0, 0) = _bias_noise.motion;
-        W(1, 1) = _bias_noise.motion;
-        W(2, 2) = _bias_noise.vertical;
-    }
-    else
-        return PYRO_OK;
+        return _correct_rest(interval);
+    return PYRO_OK;
+}
 
+status_t vqf_t::_initialize_tilt()
+{
+    const float magnitude = norm(_state.last_acc_lp);
+    if (!matrix::is_finite(magnitude) || magnitude <= std::numeric_limits<float>::min())
+    {
+        _reject_acc();
+        return PYRO_WARNING;
+    }
+    const auto direction = rotate(_state.acc_quat, _state.last_acc_lp / magnitude);
+    const auto next_acc = normalized(multiply(rotation_step(inclination_error(direction)), _state.acc_quat));
+    auto P = _error_kf.get_covariance();
+    // 初始重力对齐确定两个倾斜自由度，全局航向保留初始不确定度。
+    for (std::size_t row = 0; row < 3; ++row)
+        for (std::size_t col = 0; col < 6; ++col)
+            P(row, col) = P(col, row) = 0.0f;
+    P(0, 0) = P(1, 1) = square(_config.acc_noise / magnitude) / square(_state.acc_confidence);
+    P(2, 2) = square(_config.attitude_sigma_init * deg_to_rad);
+    const status_t result = _error_kf.reset({}, P);
+    if (result != PYRO_OK)
+        return result;
+    _state.acc_quat = next_acc;
+    _state.tilt_initialized = true;
+    _state.observation_t = 0.0f;
+    return PYRO_OK;
+}
+
+status_t vqf_t::_correct_acc(float interval)
+{
+    const float magnitude = norm(_state.last_acc_lp);
+    if (!matrix::is_finite(magnitude) || magnitude <= std::numeric_limits<float>::min())
+        return PYRO_WARNING;
+    const auto direction = rotate(_state.acc_quat, _state.last_acc_lp / magnitude);
+    const auto residual = inclination_error(direction);
+    error_kf_t::observation_t H;
+    H(0, 0) = H(1, 1) = 1.0f;
+    error_kf_t::measurement_noise_t R;
+    // 低通观测相关：按 tau/实际观测间隔放大 R，限制重复使用相邻滤波样本的信息量。
+    // 这是保守的相关时间近似，硬件噪声标定及回放用于进一步调参。
+    const float correlation_scale = std::max(1.0f, _config.tau_acc / interval);
+    R(0, 0) = R(1, 1) = square(_config.acc_noise / magnitude) * correlation_scale /
+        square(_state.acc_confidence);
+    const status_t result = _correct(residual, H, R, true);
+    if (result == PYRO_OK)
+        ++_state.acc_corrections;
+    return result;
+}
+
+status_t vqf_t::_correct_rest(float interval)
+{
+    error_kf_t::observation_t H;
+    for (std::size_t i = 0; i < 3; ++i)
+        H(i, i + 3) = 1.0f;
+    const float variance = square(_config.bias_sigma_rest * deg_to_rad) *
+        std::max(1.0f, 2.0f * _config.rest_filter_tau / interval);
+    return _correct(_state.rest_gyr_lp - _state.bias, H, identity<3>(variance), false);
+}
+
+status_t vqf_t::_gate(error_kf_t::correction_t &correction, bool acceleration)
+{
+    if (acceleration && correction.diagnostics.nis > _config.acc_nis_threshold)
+        return PYRO_WARNING;
+    if (acceleration)
+    {
+        // 六轴重力观测修正全局水平倾斜，航向误差维持陀螺传播。
+        for (std::size_t col = 0; col < 3; ++col)
+            correction.K(2, col) = 0.0f;
+        if (!_config.motion_bias_est_enabled || _state.rest_detected)
+            for (std::size_t row = 3; row < 6; ++row)
+                for (std::size_t col = 0; col < 3; ++col)
+                    correction.K(row, col) = 0.0f;
+    }
+    error_kf_t::state_t delta;
+    if (matrix::multiply(matrix::view(correction.K), matrix::view(correction.y),
+                         matrix::view(delta)) != ARM_MATH_SUCCESS)
+        return PYRO_ERROR;
+    const float angle = norm({delta[0], delta[1], delta[2]});
+    if (!matrix::is_finite(delta) || !matrix::is_finite(angle))
+        return PYRO_ERROR;
+    const float scale = angle > max_correction_angle ? max_correction_angle / angle : 1.0f;
+    correction.K *= scale;
     const float clip = _config.bias_clip * deg_to_rad;
-    for (float &value : residual)
-        value = std::clamp(value, -clip, clip);
+    for (std::size_t row = 3; row < 6; ++row)
+    {
+        const float change = delta[row] * scale;
+        const float candidate = _state.bias[row - 3] + change;
+        if (change == 0.0f || std::fabs(candidate) <= clip)
+            continue;
+        const float bounded = std::clamp(candidate, -clip, clip);
+        const float row_scale = std::clamp((bounded - _state.bias[row - 3]) / change, 0.0f, 1.0f);
+        for (std::size_t col = 0; col < 3; ++col)
+            correction.K(row, col) *= row_scale;
+    }
+    // 核心根据调整后的 K 同时执行状态及 Joseph 协方差更新。
+    return PYRO_OK;
+}
 
-    // 通过 KF 的状态增量策略执行 VQF 零偏限幅，保留核心协方差和诊断。
-    // Clip the bias via KF's delta policy, preserving covariance/diagnostics.
-    return _bias_kf.correct(residual, H, W, nullptr,
-        [this, clip](bias_kf_t::correction_t &correction)
-        {
-            if (matrix::multiply(matrix::view(correction.K),
-                                 matrix::view(correction.y),
-                                 matrix::view(correction.dx)) != ARM_MATH_SUCCESS)
-                return PYRO_ERROR;
-            for (std::size_t i = 0; i < 3; ++i)
-                correction.dx[i] =
-                    std::clamp(_bias_kf.get_state()[i] + correction.dx[i], -clip, clip) -
-                    _bias_kf.get_state()[i];
-            correction.use_dx = true;
-            return PYRO_OK;
-        });
+status_t vqf_t::_correct(const vector3_t &residual, const error_kf_t::observation_t &H,
+                         const error_kf_t::measurement_noise_t &R, bool acceleration)
+{
+    const auto prior = _error_kf.get_covariance();
+    error_kf_t::measurement_mask_t mask{true, true, !acceleration};
+    const status_t result = _error_kf.correct(residual, H, R, &mask,
+        [this, acceleration](error_kf_t::correction_t &correction)
+        { return _gate(correction, acceleration); });
+    _diagnostics = _error_kf.get_diagnostics();
+    if (acceleration)
+        _state.acc_nis = _diagnostics.nis;
+    if (result != PYRO_OK)
+        return result;
+    const status_t injected = _inject_error();
+    if (injected != PYRO_OK)
+    {
+        // 注入失败时恢复修正前协方差，名义姿态和零偏仍保持原值。
+        (void)_error_kf.reset({}, prior);
+        _diagnostics.status = injected;
+    }
+    return injected;
+}
+
+status_t vqf_t::_inject_error()
+{
+    const auto &delta = _error_kf.get_state();
+    const vector3_t angle{delta[0], delta[1], delta[2]};
+    const auto next_acc = normalized(multiply(rotation_step(angle), _state.acc_quat));
+    const auto next_bias = _state.bias + vector3_t{delta[3], delta[4], delta[5]};
+    if (!matrix::is_finite(next_acc) || !matrix::is_finite(next_bias))
+        return PYRO_ERROR;
+    auto G = identity<6>();
+    const auto J = left_jacobian(angle);
+    for (std::size_t row = 0; row < 3; ++row)
+        for (std::size_t col = 0; col < 3; ++col)
+            G(row, col) = J(row, col);
+    const auto P = G * _error_kf.get_covariance() * G.transpose();
+    const status_t result = _error_kf.reset({}, P);
+    if (result != PYRO_OK)
+        return result;
+    _state.acc_quat = next_acc;
+    _state.bias = next_bias;
+    return PYRO_OK;
 }
 
 vqf_t::state_t vqf_t::get_state() const
 {
     state_t result;
     result.quat = multiply(_state.acc_quat, _state.gyr_quat);
-    result.bias = _bias_kf.get_state();
-    result.bias_covariance = _bias_kf.get_covariance();
+    result.bias = _state.bias;
+    result.error_covariance = _error_kf.get_covariance();
+    float bound = 0.0f;
+    for (std::size_t row = 0; row < 3; ++row)
+    {
+        float sum = 0.0f;
+        for (std::size_t col = 0; col < 3; ++col)
+        {
+            result.bias_covariance(row, col) = result.error_covariance(row + 3, col + 3);
+            sum += std::fabs(result.bias_covariance(row, col));
+        }
+        bound = std::max(bound, sum);
+    }
+    result.bias_sigma = sqrtf(bound);
     result.rest_detected = _state.rest_detected;
     result.rest_t = _state.rest_t;
     result.rest_gyr_lp = _state.rest_gyr_lp;
     result.rest_acc_lp = _state.rest_acc_lp;
-    result.initialized = _bias_kf.is_initialized();
+    result.initialized = _state.tilt_initialized;
     result.consumed_gyr = _state.consumed_gyr;
     result.consumed_acc = _state.consumed_acc;
-    result.bias_diagnostics = _bias_kf.get_diagnostics();
-    float bound = 0.0f;
-    for (std::size_t row = 0; row < 3; ++row)
-    {
-        float row_sum = 0.0f;
-        for (std::size_t col = 0; col < 3; ++col)
-            row_sum += std::fabs(result.bias_covariance(row, col));
-        bound = std::max(bound, row_sum);
-    }
-    result.bias_sigma = sqrtf(std::min(bound, _coeffs.bias_p0));
+    result.acc_confidence = _state.acc_confidence;
+    result.acc_nis = _state.acc_nis;
+    result.acc_rejected = _state.acc_rejected;
+    result.acc_corrections = _state.acc_corrections;
+    result.acc_rejections = _state.acc_rejections;
+    result.bias_diagnostics = _diagnostics;
     return result;
 }
 

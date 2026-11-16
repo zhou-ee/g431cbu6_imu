@@ -75,6 +75,9 @@ volatile float    imu_service_yaw          = 0.0f;
 volatile float    imu_service_bias_rps[3]  = {0.0f, 0.0f, 0.0f};
 volatile uint32_t imu_service_rest         = 0U;
 volatile float    imu_service_rest_t       = 0.0f;
+volatile float    imu_service_acc_confidence = 0.0f;
+volatile float    imu_service_acc_nis       = 0.0f;
+volatile uint32_t imu_service_acc_rejected  = 0U;
 }
 
 namespace
@@ -83,17 +86,8 @@ namespace
 constexpr uint32_t k_cpu_mhz = 170U;
 
 /* ======================= 产品配置 =======================
- * ODR 取 1920 Hz 而非 7680 Hz：VQF 的姿态精度取决于陀螺积分的角度增量
- * 与加速度倾斜校正的时间常数（tau_acc=0.25 s，对应截止频率约 0.9 Hz），
- * 与采样率无关；1~2 kHz 远高于 VQF 官方推荐的 200~1000 Hz 上限。
- *
- * 7680 Hz 下每毫秒两路共 15.4 个样本，VQF 实测每样本约 110 µs（含零偏 KF 的
- * 3x3 矩阵求逆与多个 Butterworth 双精度递推），单拍耗时 1.6 ms 已超 1 ms 周期，
- * 会形成"越攒越多、越算越慢"的正反馈（实测跌到 330~390 Hz）。
- * 1920 Hz 下每毫秒两路共 3.8 个样本，单拍约 0.4 ms，留足 1 ms 预算。
- *
- * 若后续需要更高采样率（如做振动分析），应把 VQF 独立成低优先级任务并按
- * FIFO 批次节流，而不是提高本任务的 ODR。 */
+ * 两路 ODR 为 1920 Hz。采集与姿态传播使用全部样本，ESKF 倾斜/静止观测约 500 Hz。
+ * 单任务预算为 1 ms，imu_service_vqf_us_max 记录目标硬件的实际单批峰值。 */
 const imu_cfg_t k_imu_cfg = {
     false,                  /* calibrate_flag ：关闭上电标定，零偏交给 VQF 静止估计 */
     500U,                   /* calibrate_times：1920 Hz 下约 260 ms */
@@ -117,8 +111,9 @@ const pyro::vqf_t::config_t k_vqf_cfg = [] {
     c.rest_th_gyr  = 5.0f;   /* °/s */
     c.rest_th_acc  = 1.0f;   /* m/s² */
     c.bias_clip    = 5.0f;   /* °/s，与 rest_th_gyr 匹配 */
-    c.motion_bias_est_enabled = false; /* 高采样率下关闭运动零偏估计，省算力 */
+    c.motion_bias_est_enabled = true;  /* 可信倾斜观测参与联合 ESKF 零偏估计 */
     c.rest_bias_est_enabled   = true;  /* 保留静止零偏估计 */
+    c.acc_update_period = 0.002f;       /* 倾斜/静止观测约 500 Hz，陀螺按全部样本传播 */
     return c;
 }();
 
@@ -133,7 +128,7 @@ const uint16_t k_cs_pin = GPIO_PIN_4;
 lsm6dsv16x_spi_t s_bus(&hspi1, k_cs_port, k_cs_pin, true);
 lsm6dsv16x_drv_t s_imu(k_imu_cfg, s_bus);
 
-/* VQF 实例：固定存储（约 1.6 KB），静态区分配，无动态内存。 */
+/* VQF/ESKF 实例采用固定存储，静态区分配。 */
 pyro::vqf_t s_vqf;
 
 /* 姿态快照：采集任务写、其他任务读。
@@ -167,10 +162,8 @@ void quat_to_euler(const float q[4], float &roll, float &pitch, float &yaw)
 class imu_task_t final : public pyro::task_base_t
 {
   public:
-    /* 栈 1024 词 = 4 KB：`_update_bias` 的调用链实测最大单帧 592 B（-O0），
-     * 叠加 update → _update_acc → _update_bias → kf.correct 的嵌套接近 1.5 KB；
-     * 本任务还同时承载 read() → SPI 中间件 → 驱动解包。
-     * 早期给 512 词时栈溢出会踩坏相邻堆块，表现为 PendSV 恢复时 HardFault。 */
+    /* 栈 1024 词 = 4 KB，承载采集、ESKF 和快照发布。
+     * 通过编译器栈用量报告检查调用链，板级验证时继续检查栈高水位。 */
     imu_task_t() : task_base_t("imu", 0U, 1024U, pyro::task_base_t::priority_t::HIGH) {}
 
   protected:
@@ -289,6 +282,9 @@ class imu_task_t final : public pyro::task_base_t
                 imu_service_yaw       = yaw;
                 imu_service_rest      = state.rest_detected ? 1U : 0U;
                 imu_service_rest_t    = state.rest_t;
+                imu_service_acc_confidence = state.acc_confidence;
+                imu_service_acc_nis = state.acc_nis;
+                imu_service_acc_rejected = state.acc_rejected ? 1U : 0U;
             }
 
             /* 驱动诊断计数（总线/数据/超时） */
