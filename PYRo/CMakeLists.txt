@@ -87,15 +87,27 @@ target_include_directories(PYRo PUBLIC
 target_link_libraries(PYRo PUBLIC stm32cubemx CMSISDSP)
 
 # ------------------------------------------------------------------------------
-# 算法/驱动库按 -O2 编译（覆盖 Debug 的 -O0）
+# Algorithm 目录下的源码单独用 -O2 编译（其余目标保持外层配置，Debug 即 -O0）
 #
-# 原因：VQF 的零偏卡尔曼滤波每样本要跑 3x3 矩阵求逆、协方差更新与多个
-# Butterworth 二阶低通的变步长递推（含 double 版 exp）。-O0 下实测单样本
-# 高达 ~230 us，而 7.68 kHz 双路的实时预算只有 65 us/样本，直接打穿。
-# 库代码不需要单步调试（应用层 Module/ 仍是 -O0，可以正常打断点）。
+# 原因：VQF 的零偏卡尔曼滤波每样本要跑 3x3 矩阵求逆、协方差更新，以及多个
+# Butterworth 二阶低通的变步长递推（含 double 版 exp/cos/sin）。这些代码在
+# -O0 下实测单样本高达约 110~230 us，而 1920 Hz 双路的实时预算只有
+# 520 us/样本（7680 Hz 时更是 65 us），直接打穿实时性。
+#
+# 只对 Algorithm 生效的好处：
+#   - 工程其余部分（驱动、协议、业务层）仍是 -O0，可正常单步调试；
+#   - 算法是纯数值计算，不需要单步跟踪，优化不影响调试体验；
+#   - 不必为了一个模块把整个 PYRo 提到 -O2。
+#
+# 注意：KF（pyro_algo_kf.h + .tpp）与 Butterworth 是纯头文件，其代码由
+# pyro_algo_vqf.cpp 实例化，所以给该文件加 -O2 即可覆盖到它们。
 # ------------------------------------------------------------------------------
-target_compile_options(PYRo PRIVATE -O2)
-target_compile_options(PYRo PRIVATE $<$<CONFIG:Debug>:-O2>)
+set(PYRO_ALGO_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/Algorithm/Matrix/pyro_algo_matrix.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Algorithm/VQF/pyro_algo_vqf.cpp)
+
+set_source_files_properties(${PYRO_ALGO_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-O2")
 
 # ------------------------------------------------------------------------------
 # 可选项：把 DMA 堆放进专用段（H7 等需要避开 DTCM 的芯片）

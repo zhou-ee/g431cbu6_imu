@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="EmbeddedMonitor">
+    <option name="watchItems">
+      <list>
+        <PersistedWatchItem>
+          <option name="expr" value="imu_service_quat" />
+        </PersistedWatchItem>
+        <PersistedWatchItem>
+          <option name="expr" value="imu_service_vqf_ready" />
+        </PersistedWatchItem>
+        <PersistedWatchItem>
+          <option name="expr" value="imu_service_read_ok" />
+        </PersistedWatchItem>
+        <PersistedWatchItem>
+          <option name="expr" value="imu_service_algo_rounds" />
+        </PersistedWatchItem>
+        <PersistedWatchItem>
+          <option name="expr" value="imu_service_vqf_consumed" />
+        </PersistedWatchItem>
+        <PersistedWatchItem>
+          <option name="expr" value="imu_service_vqf_us_max" />
+        </PersistedWatchItem>
+        <PersistedWatchItem>
+          <option name="expr" value="imu_service_roll" />
+        </PersistedWatchItem>
+        <PersistedWatchItem>
+          <option name="expr" value="imu_service_pitch" />
+        </PersistedWatchItem>
+        <PersistedWatchItem>
+          <option name="expr" value="imu_service_yaw" />
+        </PersistedWatchItem>
+      </list>
+    </option>
+  </component>
+</project>

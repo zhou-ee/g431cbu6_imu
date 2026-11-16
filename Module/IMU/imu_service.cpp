@@ -112,7 +112,7 @@ const imu_cfg_t k_imu_cfg = {
  * bias_clip 必须 ≥ rest_th_gyr，否则低通值被提前截断，静止永不成立。 */
 const pyro::vqf_t::config_t k_vqf_cfg = [] {
     pyro::vqf_t::config_t c;
-    c.tau_acc      = 0.25f;  /* 加速度倾斜校正时间常数，s（默认 3.0 偏慢） */
+    c.tau_acc      = 0.4f;  /* 加速度倾斜校正时间常数，s（默认 3.0 偏慢） */
     c.rest_min_t   = 1.0f;   /* 静止确认时间，s */
     c.rest_th_gyr  = 5.0f;   /* °/s */
     c.rest_th_acc  = 1.0f;   /* m/s² */
