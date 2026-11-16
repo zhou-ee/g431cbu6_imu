@@ -3,8 +3,14 @@
 #include "imu_base_drv.h"
 #include "lsm6dsv16x_middleware.h"
 
-/* 每流样本容量。未及时消费导致缓冲满时覆盖最旧样本，并计入 err_data。 */
-static constexpr uint8_t LSM6DSV16X_SAMPLE_BUF_FRAMES = 24U;
+/* 每流样本容量。未及时消费导致缓冲满时覆盖最旧样本，并计入 err_data。
+ *
+ * 容量按"采集任务最多被推迟多久"倒推，而不是按典型一拍：
+ *   1920 Hz → 64 帧 ≈ 33 ms（当前产品配置，单拍 1 ms，余量 33 拍）
+ *   7680 Hz → 64 帧 ≈ 8.3 ms（产品目标速率，仍需 ≥3 拍余量）
+ * 原值 24 在 7680 Hz 下只有 3.1 ms，一轮 read() 的两段 DMA 各可能超时 2 ms，
+ * 一次抖动就会开始覆盖未消费样本。两路各 64×16 B，静态 RAM 增加 1 KB。 */
+static constexpr uint8_t LSM6DSV16X_SAMPLE_BUF_FRAMES = 64U;
 
 /* 单次传输上限，超出部分留待后续读取。每个 FIFO 字占 7 字节。 */
 static constexpr uint16_t LSM6DSV16X_MAX_WORDS_PER_XFER = LSM6DSV16X_MAX_BURST / 7U;

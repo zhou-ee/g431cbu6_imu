@@ -24,9 +24,11 @@ extern "C" arm_status __real_arm_mat_mult_f32(const arm_matrix_instance_f32 *,
 extern "C" arm_status __wrap_arm_mat_mult_f32(const arm_matrix_instance_f32 *a,
     const arm_matrix_instance_f32 *b, arm_matrix_instance_f32 *out)
 {
-    bool injection = fail_injection && a->numRows == 6 && a->numCols == 6 && b->numCols == 6 &&
-        a->pData[0] > 0.999f && a->pData[7] > 0.999f &&
-        a->pData[3] == 0.0f && a->pData[10] == 0.0f && a->pData[17] == 0.0f;
+    /* 注入目标：误差注入的块运算 G·P·Gᵀ 里第一次 3×3 乘法（a = J_l，小角度下近单位阵）。
+     * 改用块结构后，"G·P" 这个 6×6 乘法已不存在，故判别式从 6×6 改为 3×3。
+     * 加速度-only 路径上不会触发 _update_gyr，因此这里的 3×3 乘法只来自 _inject_error。 */
+    bool injection = fail_injection && a->numRows == 3 && a->numCols == 3 && b->numCols == 3 &&
+        a->pData[0] > 0.999f && a->pData[4] > 0.999f && a->pData[8] > 0.999f;
     if (fail_product || injection)
     {
         fail_product = false;

@@ -24,6 +24,24 @@ constexpr float GRAVITY    = 9.80665f;             /* 标准重力加速度 m/s�
 /* 时间戳计数器复位值：向 TIMESTAMP2(42h) 写 0xAA 可将 32 位计数器清零（AN5640 6.4 节） */
 constexpr uint8_t TIMESTAMP_RESET_VALUE = 0xAA;
 
+/* 小端逐字节读取。
+ * FIFO 字与直读缓冲都只有 1 字节对齐，原先的 reinterpret_cast<int16_t*>/
+ * <uint32_t*> 属于未对齐访问 + 严格别名违规：Cortex-M4 的 LDR/LDRH 容忍未对齐
+ * 所以"能跑"，但换架构/编译器或开更激进的优化就会出问题。
+ * 逐字节组装顺带把线上字节序写明，不再依赖目标机字节序。 */
+inline int16_t load_i16le(const uint8_t *p)
+{
+    const uint16_t lo = static_cast<uint16_t>(p[0]);
+    const uint16_t hi = static_cast<uint16_t>(static_cast<uint16_t>(p[1]) << 8U);
+    return static_cast<int16_t>(static_cast<uint16_t>(lo | hi));
+}
+
+inline uint32_t load_u32le(const uint8_t *p)
+{
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8U) |
+           (static_cast<uint32_t>(p[2]) << 16U) | (static_cast<uint32_t>(p[3]) << 24U);
+}
+
 /* ---------------- 映射/工具函数：前向声明（实现见文件末尾 ③） ---------------- */
 bool xl_odr_code(uint16_t hz, uint8_t &code);
 bool gy_odr_code(uint16_t hz, uint8_t &code);
@@ -161,8 +179,8 @@ bool lsm6dsv16x_drv_t::read_direct() {
             return false;
         }
     }
-    const int16_t *raw = reinterpret_cast<const int16_t *>(_fifo_raw);
-    _data.temperature = (static_cast<float>(raw[0]) / TEMP_LSB_PER_C) + TEMP_ZERO_C;
+    /* 20h~2Dh 解包：温度 1 + 陀螺 3 + 加速度 3，逐个小端 int16 */
+    _data.temperature = (static_cast<float>(load_i16le(&_fifo_raw[0])) / TEMP_LSB_PER_C) + TEMP_ZERO_C;
 
     /* 时间戳计数器（TIMESTAMP0~3，同样逐字节小读）；读数失败则沿用上次值，下一帧自愈 */
     uint8_t ts[4] = {0U, 0U, 0U, 0U};
@@ -174,7 +192,7 @@ bool lsm6dsv16x_drv_t::read_direct() {
         }
     }
     if (ts_ok) {
-        _fifo.pend_ts = *reinterpret_cast<uint32_t *>(&ts);
+        _fifo.pend_ts = load_u32le(ts);
     } else {
         ++_fifo.err_bus;
     }
@@ -184,21 +202,21 @@ bool lsm6dsv16x_drv_t::read_direct() {
     gyro_sample_t *gp = gyro_alloc();
     acc_sample_t  *ap = acc_alloc();
 
-    /* 陀螺：dps → rad/s，逐轴减零偏 */
+    /* 陀螺：dps → rad/s，逐轴减零偏。raw[1..3] 对应字节偏移 2/4/6 */
     gyro_sample_t &g = *gp;
     g.timestamp = _fifo.pend_ts;
     const float gyro_lsb = _gyro_dps_per_lsb; /* 数据手册指定的 dps/LSB */
-    g.Gyro[0] = (static_cast<float>(raw[1]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gx_offset;
-    g.Gyro[1] = (static_cast<float>(raw[2]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gy_offset;
-    g.Gyro[2] = (static_cast<float>(raw[3]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gz_offset;
+    g.Gyro[0] = (static_cast<float>(load_i16le(&_fifo_raw[2])) * gyro_lsb * DEG_TO_RAD) - _data.cali.gx_offset;
+    g.Gyro[1] = (static_cast<float>(load_i16le(&_fifo_raw[4])) * gyro_lsb * DEG_TO_RAD) - _data.cali.gy_offset;
+    g.Gyro[2] = (static_cast<float>(load_i16le(&_fifo_raw[6])) * gyro_lsb * DEG_TO_RAD) - _data.cali.gz_offset;
 
-    /* 加速度：g → m/s² */
+    /* 加速度：g → m/s²。raw[4..6] 对应字节偏移 8/10/12 */
     acc_sample_t &a = *ap;
     a.timestamp = _fifo.pend_ts;
     const float acc_lsb = (_acc_fs_g * GRAVITY) / 32768.0f; /* m/s²/LSB */
-    a.Accel[0] = static_cast<float>(raw[4]) * acc_lsb;
-    a.Accel[1] = static_cast<float>(raw[5]) * acc_lsb;
-    a.Accel[2] = static_cast<float>(raw[6]) * acc_lsb;
+    a.Accel[0] = static_cast<float>(load_i16le(&_fifo_raw[8])) * acc_lsb;
+    a.Accel[1] = static_cast<float>(load_i16le(&_fifo_raw[10])) * acc_lsb;
+    a.Accel[2] = static_cast<float>(load_i16le(&_fifo_raw[12])) * acc_lsb;
     return true;
 }
 
@@ -289,8 +307,8 @@ bool lsm6dsv16x_drv_t::read_fifo_batch() {
 }
 
 /**
- * @brief 解析一个 FIFO 字（7 字节）：按首字节 TAG 分派，数据区（word+1）按需强转
- *        （陀螺/加速度 = 3 个 int16，温度 = 1 个 int16，时间戳 = uint32，均小端）。
+ * @brief 解析一个 FIFO 字（7 字节）：按首字节 TAG 分派，数据区（word+1）按小端
+ *        逐字节解包（陀螺/加速度 = 3 个 int16，温度 = 1 个 int16，时间戳 = uint32）。
  *        TAG 位[7:3]：0x01 陀螺 / 0x02 加速度 / 0x03 温度 / 0x04 时间戳。
  * @note  pend_ts 跨调用保持：读边界切在槽中间时（如只读到陀螺字），
  *        下一轮读到同槽的加速度字仍用同一个时间戳，对齐不会错。
@@ -303,12 +321,11 @@ void lsm6dsv16x_drv_t::fifo_parse_word(const uint8_t *word) {
             gyro_sample_t &s = *gyro_alloc(); /* 满则覆盖最旧，总返回有效指针 */
             s.timestamp = _fifo.pend_ts;
 
-            const auto *raw = reinterpret_cast<const int16_t *>(word + 1);
             const float gyro_lsb = _gyro_dps_per_lsb; /* 数据手册指定的 dps/LSB */
-            /* dps → rad/s，逐轴减零偏 */
-            s.Gyro[0] = (static_cast<float>(raw[0]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gx_offset;
-            s.Gyro[1] = (static_cast<float>(raw[1]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gy_offset;
-            s.Gyro[2] = (static_cast<float>(raw[2]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gz_offset;
+            /* dps → rad/s，逐轴减零偏。数据区 6 字节 = X/Y/Z 各一个小端 int16 */
+            s.Gyro[0] = (static_cast<float>(load_i16le(word + 1)) * gyro_lsb * DEG_TO_RAD) - _data.cali.gx_offset;
+            s.Gyro[1] = (static_cast<float>(load_i16le(word + 3)) * gyro_lsb * DEG_TO_RAD) - _data.cali.gy_offset;
+            s.Gyro[2] = (static_cast<float>(load_i16le(word + 5)) * gyro_lsb * DEG_TO_RAD) - _data.cali.gz_offset;
             break;
         }
 
@@ -316,22 +333,21 @@ void lsm6dsv16x_drv_t::fifo_parse_word(const uint8_t *word) {
             acc_sample_t &s = *acc_alloc();
             s.timestamp = _fifo.pend_ts;
 
-            const auto *raw = reinterpret_cast<const int16_t *>(word + 1);
             const float acc_lsb = (_acc_fs_g * GRAVITY) / 32768.0f; /* m/s²/LSB */
-            s.Accel[0] = static_cast<float>(raw[0]) * acc_lsb;
-            s.Accel[1] = static_cast<float>(raw[1]) * acc_lsb;
-            s.Accel[2] = static_cast<float>(raw[2]) * acc_lsb;
+            s.Accel[0] = static_cast<float>(load_i16le(word + 1)) * acc_lsb;
+            s.Accel[1] = static_cast<float>(load_i16le(word + 3)) * acc_lsb;
+            s.Accel[2] = static_cast<float>(load_i16le(word + 5)) * acc_lsb;
             break;
         }
 
         case FIFO_DATA_OUT_TAG_TIMESTAMP:
-            _fifo.pend_ts = *reinterpret_cast<const uint32_t *>(word + 1);
+            _fifo.pend_ts = load_u32le(word + 1);
             break;
 
         case FIFO_DATA_OUT_TAG_TEMP:
             /* 温度 = raw / 256 + 25（°C）；60Hz 才刷新，直接更新最新值 */
             _data.temperature =
-                (static_cast<float>(*reinterpret_cast<const int16_t *>(word + 1)) / TEMP_LSB_PER_C) + TEMP_ZERO_C;
+                (static_cast<float>(load_i16le(word + 1)) / TEMP_LSB_PER_C) + TEMP_ZERO_C;
             break;
 
         default:

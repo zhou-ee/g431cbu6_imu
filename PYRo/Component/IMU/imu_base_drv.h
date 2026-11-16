@@ -30,7 +30,12 @@ struct imu_cali_t {
     float gx_offset = -0.010767111;
     float gy_offset = 0.013010208;
     float gz_offset =-0.0014672983;
-    float g_norm;      /* 静止加速度模长，m/s² */
+    /* 静止加速度模长，m/s²。目前只有 calibrate() 写入、尚无读者
+     * （本产品不输出"去重力线性加速度"）。
+     * 默认取标准重力而不是 0：将来按下式取线性加速度时
+     *     linear = acc - (g_norm != 0 ? g_norm : 9.80665) * 单位重力方向
+     * 默认 0 会让分母为 0、方向无定义，且这种错误是静默的。 */
+    float g_norm = 9.80665f;
 };
 
 /**

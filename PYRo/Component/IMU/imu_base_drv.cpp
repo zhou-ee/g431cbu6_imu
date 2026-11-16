@@ -1,4 +1,6 @@
 #include "imu_base_drv.h"
+#include "main.h" /* HAL_GetTick()：标定超时判据 */
+
 #include <cmath>
 
 imu_base_drv::~imu_base_drv() = default;
@@ -9,9 +11,10 @@ imu_base_drv::~imu_base_drv() = default;
  *        加速度写入 acc 流，两者未被消费的数量体现在 acc.count / gyro.count"。
  *        本函数不关心 read() 的返回值，只按两路计数判断本批有没有新数据。
  *        标定期间器件需保持静止。两路独立计数，各自攒够 target 个样本为止
- *        （陀螺/加速度同速率时同步完成；7680 Hz 下 500 个约 65 ms）。
+ *        （陀螺/加速度同速率时同步完成；1920 Hz 下 500 个约 260 ms）。
  *        本函数会**消费**样本（读后调 assume_*），避免下一轮重复累加同一批。
  *        单位：Gyro 为 rad/s；Accel 为 m/s²，故静止时 g_norm ≈ 9.80665。
+ * @note  超时判据基于真实时间（HAL_GetTick），不是循环次数：见下方常量说明。
  */
 bool imu_base_drv::calibrate() {
     const uint16_t target = (_data.cfg.calibrate_times > 0U) ? _data.cfg.calibrate_times : 2000U;
@@ -29,11 +32,24 @@ bool imu_base_drv::calibrate() {
     double   sum_norm    = 0.0;
     uint32_t got_gyro    = 0U;
     uint32_t got_acc     = 0U;
-    uint32_t guard       = 0U;
+
+    /* 停滞与总时长保护（旧实现用"连续无进展的循环次数 5e6"，
+     * 而每次循环至少一次 read()（≥1 ms），实际要几十分钟才触发，等于没保护）。
+     *   ① 连续 k_calib_stall_ms 没有任何新样本 → 器件停摆 / 总线不通；
+     *   ② 总时长超过标称耗时的 3 倍 + 500 ms → 器件实际 ODR 与配置不符。 */
+    constexpr uint32_t k_calib_stall_ms = 200U;
+    const uint32_t min_freq_hz = (_data.cfg.acc_freq < _data.cfg.gyro_freq)
+                                     ? _data.cfg.acc_freq
+                                     : _data.cfg.gyro_freq;
+    const uint32_t freq_hz    = (min_freq_hz > 0U) ? min_freq_hz : 1000U;
+    const uint32_t nominal_ms = 1000U * static_cast<uint32_t>(target) / freq_hz;
+    const uint32_t budget_ms  = nominal_ms * 3U + 500U;
+    const uint32_t start_ms   = HAL_GetTick();
+    uint32_t       last_progress_ms = start_ms;
 
     while (got_gyro < static_cast<uint32_t>(target) || got_acc < static_cast<uint32_t>(target)) {
         const uint32_t previous_gyro_count = got_gyro;
-        const uint32_t previous_acc_count = got_acc;
+        const uint32_t previous_acc_count  = got_acc;
         (void)read(); /* 标定不关心返回值，只看两路 count */
 
         const uint8_t ng = _data.gyro.count;
@@ -57,9 +73,13 @@ bool imu_base_drv::calibrate() {
         /* 消费掉本批，下一轮才不会被重复累加 */
         assume_gyro_point(ng);
         assume_acc_point(na);
+
+        const uint32_t now_ms = HAL_GetTick();
         if (got_gyro != previous_gyro_count || got_acc != previous_acc_count) {
-            guard = 0U;
-        } else if (++guard > 5000000U) {
+            last_progress_ms = now_ms;
+        }
+        if ((now_ms - last_progress_ms) > k_calib_stall_ms ||
+            (now_ms - start_ms) > budget_ms) {
             /* 以实际标定进度检测停滞，覆盖仅一路有数据的情况。 */
             _data.cali = previous_cali;
             return false;

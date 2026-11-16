@@ -45,6 +45,16 @@ public:
 
     status_t init() const;
     status_t start() const;
+
+    /* 提交一个经典 CAN 标准数据帧（固定 8 字节）。
+     *
+     * 契约：本函数**从不撤销已经入队的帧**。
+     *   PYRO_OK    已入队
+     *   PYRO_BUSY  发送队列已满（G4 固定 3 个元素）或上一帧 BusOff 刚刚恢复，
+     *              本次未入队；调用方保留内容并重试。已入队的帧仍会正常发出。
+     *   PYRO_ERROR 参数/状态错误
+     * 因此"一组多帧"的原子性由调用方用有界队列 + 整组重试保证，
+     * 不能靠本函数回滚——回滚会把同组已入队的前几帧一起丢掉。 */
     status_t send_msg(uint32_t id, const uint8_t *data) const;
     status_t register_rx_msg(can_msg_buffer_t *msg_buffer);
     status_t handle_rx_msg(uint32_t id, const uint8_t *data);

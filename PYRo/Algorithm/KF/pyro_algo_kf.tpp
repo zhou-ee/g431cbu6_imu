@@ -99,6 +99,45 @@ status_t kf_t<N, Z, CheckNumerics>::reset(const state_t &x0,
 }
 
 template <std::size_t N, std::size_t Z, bool CheckNumerics>
+status_t kf_t<N, Z, CheckNumerics>::predict_covariance(const state_t &x_pred,
+                                                       const covariance_t &P_propagated,
+                                                       const covariance_t &Q_d)
+{
+    _prepared    = false;
+    _diagnostics = {};
+    if (!_initialized)
+        return _report(PYRO_NOT_FOUND, result_t::NOT_INITIALIZED);
+    if constexpr (CheckNumerics)
+    {
+        if (!matrix::is_finite(x_pred) || !_covariance_valid(P_propagated.data(), N) ||
+            !_covariance_valid(Q_d.data(), N))
+            return _report(PYRO_PARAM_ERROR, result_t::INVALID_INPUT);
+        for (std::size_t row = 0; row < N; ++row)
+            if (P_propagated[row * N + row] < 0.0f)
+                return _report(PYRO_PARAM_ERROR, result_t::INVALID_INPUT);
+    }
+    _diagnostics.status = PYRO_ERROR;
+    _diagnostics.result = result_t::MATH_FAILURE;
+    // 调用方已算出 F·P·Fᵀ，这里只补 +Qd（与通用 predict 相同的逐元素顺序）。
+    // Caller already produced F·P·Fᵀ; only +Qd remains, elementwise as in predict.
+    _diagnostics.math_status =
+        matrix::add({P_propagated.data(), N, N}, {Q_d.data(), N, N},
+                    {P_next_.data(), N, N});
+    CHECK_ARM_MATH_RET(_diagnostics.math_status);
+    if constexpr (CheckNumerics)
+    {
+        if (!matrix::is_finite(P_next_))
+            return _report(PYRO_ERROR, result_t::NON_FINITE_RESULT);
+    }
+    _finish_covariance(P_next_);
+    x_next_ = x_pred;
+    x_      = x_next_;
+    P_      = P_next_;
+    K_.fill(0.0f);
+    return _report(PYRO_OK, result_t::PREDICTED);
+}
+
+template <std::size_t N, std::size_t Z, bool CheckNumerics>
 status_t kf_t<N, Z, CheckNumerics>::predict(const state_t &x_pred,
                                             const transition_t &F,
                                             const covariance_t &Q_d,

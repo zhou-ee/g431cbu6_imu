@@ -3,8 +3,8 @@
  * @brief   IMU 采集 + VQF 姿态融合服务（任务层）。
  *
  * 单个常驻任务按 1 ms 固定周期顺序完成：读取一拍 → VQF 融合 → 归还样本 →
- * 发布姿态快照。任务内部不对外暴露"状态查询/FIFO/直读"这些细节，
- * 上层只通过 imu_service_attitude() 取姿态、或 read_imu_data() 取原始量。
+ * 发布姿态快照。任务内部不对外暴露"状态查询/FIFO/直读"这些细节，上层只通过
+ * imu_service_attitude() 取姿态快照；驱动原始样本流是采集任务的私有状态。
  *
  * 航向零点：6 轴 VQF 的航向不可观测，yaw 零点必须由产品定义。快照写入前
  * 用 Rz(-yaw0) 左乘姿态完成归零，只改 yaw，roll/pitch 与重力参考不受影响。
@@ -50,11 +50,12 @@ struct imu_attitude_t
  * @retval PYRO_ALREADY_INIT 重复调用 */
 pyro::status_t imu_service_start();
 
-/* 解包后的原始数据（只读视图）。 */
-imu_data_t &imu_service_data();
-
 /* 姿态结果快照（按值返回，且保证是某一次完整更新的结果）。
- * 可在任意任务上下文调用；若写入方正在更新，内部会重试，不会返回撕裂数据。 */
+ * 可在任意【任务】上下文调用；若写入方正在更新，内部会重试，不会返回撕裂数据。
+ * 不可在中断上下文调用：读侧依赖"写方一定能拿到 CPU 把序号置回偶数"。
+ *
+ * 驱动内部的原始样本流（imu_data_t，含环形缓冲头、量程/标定参数）不再对外
+ * 暴露——它是驱动私有状态，外部直接读会与采集任务并发访问同一环形缓冲。 */
 imu_attitude_t imu_service_attitude();
 
 /* ---------------- 调试观测（调试器 watch 用，零依赖，可随时删除） ---------------- */
@@ -71,6 +72,8 @@ extern volatile uint32_t imu_service_vqf_err;       /* VQF 返回 ERROR 的次�
 extern volatile uint32_t imu_service_vqf_warn;      /* VQF 返回 WARNING 的次数 */
 extern volatile int32_t  imu_service_vqf_status;    /* 最近一次 VQF update 的返回值 */
 extern volatile uint32_t imu_service_vqf_us_max;    /* 单批 VQF 耗时峰值（µs，每秒刷新）*/
+extern volatile uint32_t imu_service_vqf_us_avg;    /* 单批 VQF 平均耗时（µs，每秒刷新）*/
+extern volatile uint32_t imu_service_loop_us_avg;   /* 整拍平均耗时：读+融合+发布（µs）*/
 extern volatile uint32_t imu_service_drop_samples;  /* 保留字段（单任务下恒 0）*/
 extern volatile uint32_t imu_service_heap_free_min; /* 任务拉起后的 FreeRTOS 堆余量（字节）*/
 extern volatile float    imu_service_accel_mps2[3]; /* 最新加速度（m/s²）*/

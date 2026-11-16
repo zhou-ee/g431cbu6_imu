@@ -27,9 +27,12 @@
  * 的 head 在处理期间不会移动，样本天然按时间戳单调。本工程的测试工程
  * lsm6dsv_test 正是单任务结构，在 7680 Hz 下稳定运行，这里与其保持一致。
  *
- * 代价：VQF 的耗时计入 1 ms 周期内。实测单批（约 8 样本/路）在 -O2 下远小于
- * 预算；若后续加入更多算法导致超标，应通过降低 ODR 或分频送入融合解决，
- * 而不是重新拆成双任务。
+ * 代价：VQF 的耗时计入 1 ms 周期内。实测（1920 Hz，约 2 样本/路）：update() 平均 518 µs、
+ * 峰值 793 µs；整拍（读+融合+发布）平均 668 µs，循环速率 ≈999 Hz。
+ * 峰值距 1 ms 还有约 207 µs 留给两段 SPI/DMA 读取与快照发布；这一余量来自两轮优化
+ * （矩阵暂存复用、块结构协方差传播，详见 PYRo/Algorithm/VQF/README.md）。
+ * 若后续加入更多算法导致超标，应通过降低 ODR、降低观测频率或分频送入融合解决，
+ * 而不是重新拆成双任务（双任务的坑见上）。耗时分布与优化记录见 README。
  *
  * ---------------------------- 关于实时性 ----------------------------
  * read() 内部经 DMA 完成信号量让出 CPU，不轮询；SPI 传输期间任务处于阻塞态。
@@ -64,6 +67,8 @@ volatile uint32_t imu_service_vqf_err      = 0U;
 volatile uint32_t imu_service_vqf_warn     = 0U;
 volatile int32_t  imu_service_vqf_status   = 0;
 volatile uint32_t imu_service_vqf_us_max   = 0U;
+volatile uint32_t imu_service_vqf_us_avg   = 0U;   /* 每秒窗口内 update() 平均耗时 */
+volatile uint32_t imu_service_loop_us_avg  = 0U;   /* 每秒窗口内整拍平均耗时（读+融合+发布） */
 volatile uint32_t imu_service_drop_samples = 0U;
 volatile uint32_t imu_service_heap_free_min = 0U;
 volatile float    imu_service_accel_mps2[3] = {0.0f, 0.0f, 0.0f};
@@ -252,11 +257,16 @@ class imu_task_t final : public pyro::task_base_t
     void run_loop() override
     {
         uint32_t us_max = 0U;
+        uint32_t us_sum = 0U;      /* 窗口内 update() 累计耗时 */
+        uint32_t win_rounds = 0U;  /* 窗口内实际执行融合的拍数 */
+        uint32_t loop_sum = 0U;    /* 窗口内整拍累计耗时 */
+        uint32_t loop_cnt = 0U;
         uint32_t next_1s = xTaskGetTickCount() + 1000U;
         TickType_t wake = xTaskGetTickCount();
 
         for (;;)
         {
+            const uint32_t t_loop0 = pyro::dwt_drv_t::get_current_ticks();
             /* ---- ① 读取一拍：内部完成状态查询与两段 DMA 等待 ----
              * 本任务不感知数据来源（FIFO / 直读），也不感知状态字节。 */
             if (s_imu.read())
@@ -289,6 +299,8 @@ class imu_task_t final : public pyro::task_base_t
                 const pyro::status_t st = s_vqf.update(data);
                 const uint32_t us = (pyro::dwt_drv_t::get_current_ticks() - t0) / k_cpu_mhz;
                 if (us > us_max) { us_max = us; }
+                us_sum += us;
+                ++win_rounds;
 
                 imu_service_vqf_status = static_cast<int32_t>(st);
                 if (st == pyro::PYRO_WARNING)
@@ -300,7 +312,8 @@ class imu_task_t final : public pyro::task_base_t
                     ++imu_service_vqf_err;  /* 参数非法，本批提前结束 */
                 }
 
-                const pyro::vqf_t::state_t state = s_vqf.get_state();
+                pyro::vqf_t::state_t state;
+                s_vqf.get_state(state);
 
                 /* ---- ③ 按 VQF 实际消费量归还 ----
                  * ERROR 时未消费的样本留在环里，下批继续；不会重复也不会丢。 */
@@ -361,9 +374,19 @@ class imu_task_t final : public pyro::task_base_t
                 next.heading_zeroed  = s_heading.zeroed;
                 next.heading_quality = s_heading.quality;
 
+                /* 写侧在【挂起调度器】的极短窗口内完成 置奇 → 写入 → 置偶：
+                 *   ① 若只靠两次自增，更高优先级的读者会读到奇序号后一直空转，
+                 *      而写方正是被它抢占的——双方互等（活锁）；
+                 *   ② vTaskSuspendAll 只禁止任务切换，不屏蔽中断，SPI/DMA 完成
+                 *      照常进 ISR，与"用临界区屏蔽 DMA 中断导致采集降频"的老坑不同；
+                 *   ③ 窗口内只有约 60 字节赋值与两次自增（≈1 µs），不进入慢路径。
+                 * __DMB 保证结构体赋值不会被编译器挪到第二次自增之后。 */
+                vTaskSuspendAll();
                 ++s_attitude_seq; /* 奇数：更新中 */
                 s_attitude = next;
+                __DMB();
                 ++s_attitude_seq; /* 偶数：稳定 */
+                (void)xTaskResumeAll();
 
                 /* ④-4 调试观测镜像：与快照同坐标系、同零点 */
                 for (uint8_t i = 0U; i < 4U; ++i) { imu_service_quat[i] = q[i]; }
@@ -391,12 +414,20 @@ class imu_task_t final : public pyro::task_base_t
             imu_service_err_data    = d.err_data;
             imu_service_err_timeout = d.err_timeout;
 
-            /* 每秒窗口：刷新 VQF 单批耗时峰值 */
+            /* 每秒窗口：刷新 VQF 单批耗时峰值与整拍/融合平均耗时 */
+            loop_sum += (pyro::dwt_drv_t::get_current_ticks() - t_loop0) / k_cpu_mhz;
+            ++loop_cnt;
             if (static_cast<int32_t>(xTaskGetTickCount() - next_1s) >= 0)
             {
                 next_1s += 1000U;
-                imu_service_vqf_us_max = us_max;
+                imu_service_vqf_us_max  = us_max;
+                imu_service_vqf_us_avg  = (win_rounds > 0U) ? (us_sum / win_rounds) : 0U;
+                imu_service_loop_us_avg = (loop_cnt > 0U) ? (loop_sum / loop_cnt) : 0U;
                 us_max = 0U;
+                us_sum = 0U;
+                win_rounds = 0U;
+                loop_sum = 0U;
+                loop_cnt = 0U;
             }
 
             /* 固定周期：把本拍耗时从间隔里扣掉，避免执行时间累积成降频。 */
@@ -412,23 +443,21 @@ bool s_started = false;
 
 /* ============================== 对外接口 ============================== */
 
-imu_data_t &imu_service_data()
-{
-    return s_imu.read_imu_data();
-}
-
 imu_attitude_t imu_service_attitude()
 {
     /* seqlock 读侧：seq 为偶数且拷贝前后未变，说明拿到的是一次完整更新。
-     * 写方（采集任务）可能在拷贝中途抢占，此时 seq 变化，重试即可。
-     * 重试上界很小：每次更新只占几十条指令。 */
+     * 读方可能在拷贝中途被写方抢占（写方优先级更高），此时 seq 变化，重试即可。
+     *
+     * 奇序号空转不会活锁：写方把"置奇→写入→置偶"包在 vTaskSuspendAll 窗口内，
+     * 任务级读者不可能观察到奇序号。代价是【不能中断上下文调用】——ISR 若读到
+     * 奇序号，写方永远不会有 CPU 把它置回偶数。 */
     imu_attitude_t snapshot{};
     for (;;)
     {
         const uint32_t seq_before = s_attitude_seq;
         if ((seq_before & 1U) != 0U)
         {
-            continue; /* 正在写，等下一个完整状态 */
+            continue; /* 保留为防御：写方窗口内被 ISR 读取时会走到这里 */
         }
         snapshot = s_attitude;
         __DMB(); /* 保证结构体拷贝先于 seq 的再次读取完成 */

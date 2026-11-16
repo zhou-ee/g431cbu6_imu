@@ -13,6 +13,8 @@ constexpr uint32_t CAN_NOTIFY_FLAGS =
     FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_BUS_OFF |
     FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR;
 
+/* 撤销全部在发请求。**仅用于 BusOff 恢复**：此时发送队列已无意义，必须清空才能
+ * 重新 Start。正常发送路径不得调用它——见 send_msg() 的说明。 */
 void abort_pending_tx(FDCAN_HandleTypeDef *hfdcan)
 {
     if (nullptr == hfdcan)
@@ -194,10 +196,14 @@ pyro::status_t can_drv_t::send_msg(const uint32_t id, const uint8_t *data) const
     tx_header.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
     tx_header.MessageMarker       = 0;
 
+    /* 队列满只报告忙，**绝不撤销在发请求**。
+     * G4 的发送 FIFO 固定 3 个元素（消息 RAM 布局由 HAL 编译期宏固定），
+     * 一组三帧恰好占满；若在这里 abort 掉 TXBRP，同一组已入队的前几帧会一起
+     * 丢失，接收端既无法用序号也无法用到达顺序判断"丢组"还是"错序"。
+     * 积压管理属于调用方：有界队列 + 重试 + 整组推进（见 Module/PROTOCOL.md）。 */
     taskENTER_CRITICAL();
     if (0U == HAL_FDCAN_GetTxFifoFreeLevel(_hfdcan))
     {
-        abort_pending_tx(_hfdcan);
         _hfdcan->ErrorCode &= ~HAL_FDCAN_ERROR_FIFO_FULL;
         taskEXIT_CRITICAL();
         return pyro::PYRO_BUSY;
@@ -210,7 +216,7 @@ pyro::status_t can_drv_t::send_msg(const uint32_t id, const uint8_t *data) const
     {
         if (0U != (_hfdcan->ErrorCode & HAL_FDCAN_ERROR_FIFO_FULL))
         {
-            abort_pending_tx(_hfdcan);
+            /* 竞态下 FIFO 刚被填满：同样只报告忙，保留已入队的帧 */
             _hfdcan->ErrorCode &= ~HAL_FDCAN_ERROR_FIFO_FULL;
             taskEXIT_CRITICAL();
             return pyro::PYRO_BUSY;

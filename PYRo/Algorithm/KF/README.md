@@ -84,6 +84,11 @@ if (filter.predict(x_pred, F, Q_d) == pyro::PYRO_OK)
 F 只用于误差传播；外部可采用线性、非线性或其他状态模型。
 第四个可选参数 `P_prior` 是输入 P 的借用指针，可用于外部渐消，默认使用当前 P。
 
+`predict_covariance(x_pred,P_propagated,Q_d)` 是同一提交语义的变体：调用方按状态转移的
+结构自己算出 `F*P*Fᵀ`（例如 F 为块三角、可用若干次小矩阵乘法），核心只负责 `+Q_d`、
+数值检查、对称化/方差下限与提交。语义与 `predict(...,F,Q_d)` 一致（含 `PREDICTED`
+结果码），只是省掉通用的两次 N×N 乘法。INS 的误差状态模型即用此入口传播协方差。
+
 `correct(y,H,R)` 直接融合观测残差。线性模型 `y=z-H*x`，非线性模型 `y=z-h(x)`；
 角度环绕等残差适配同样由外部完成。缺测使用 `measurement_mask_t`，false 行不参与
 计算，对应 H 行/R 行列无需有效数据。未提供 mask 时启用全部行，有效 y/H/R 必须有限。

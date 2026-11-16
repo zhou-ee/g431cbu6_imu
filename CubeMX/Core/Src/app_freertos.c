@@ -112,8 +112,11 @@ void StartDefaultTask(void const * argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
   /* IMU 采集链路启动：调度器已运行，满足信号量 / HAL_Delay / DMA 等待前提。
-   * 本调用内部完成器件初始化并拉起 capture 与 algo 两个常驻任务，
-   * 失败原因见 imu_module_init_result 与 imu_service_* 诊断量。 */
+   * 本调用内部完成器件初始化并拉起【单个】采集+融合常驻任务（早期版本的
+   * capture / algo 双任务已合并，原因见 Module/IMU/imu_service.cpp 文件头）。
+   * 失败原因见 imu_module_init_result 与 imu_service_* 诊断量。
+   * 注：本任务完成初始化后只是空转保活；其 4 KB 栈长期占用 FreeRTOS 堆，
+   * 若确认不需要它承担后续复位/看护职责，可在此改为 vTaskDelete(NULL)。 */
   (void)imu_module_init();
   /* Infinite loop */
   for(;;)

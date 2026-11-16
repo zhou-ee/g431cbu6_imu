@@ -91,6 +91,9 @@ class vqf_t
      * 门控/恢复等待返回 WARNING 并继续本批。其他错误终止批次，保留已提交步骤。
      * 加速度帧在处理开始后计入消费量，避免重试时重复推进滤波历史。 */
     status_t update(const imu_data_t &data);
+    /* 填充出参版本：热路径（1 kHz）用它避免把约 200 B 的 state_t 按值返回再拷贝。 */
+    void get_state(state_t &out) const;
+    /* 按值返回的便捷版本；测试与一次性诊断使用。 */
     [[nodiscard]] state_t get_state() const;
 
     // 诊断分支，0 正常，1 流非法，2 tick_s 非法，3 tick_s 改变，4 时间倒退，5 dt 非法。
@@ -150,6 +153,46 @@ class vqf_t
     butterworth_lpf_t<3> _acc_lp{};
     butterworth_lpf_t<3> _rest_gyr_lp{};
     butterworth_lpf_t<3> _rest_acc_lp{};
+
+    /* ---- 热路径复用暂存 ----------------------------------------------------
+     * 原来 _update_gyr / _inject_error 每个样本都在栈上构造 7~9 个 matrix_t
+     * 临时量，而 matrix_t 默认构造会逐字节清零（newlib memset 是 byte 循环），
+     * PC 采样显示 memset 占 11% CPU、约 4 KB/ms 的零初始化。
+     * 提为成员复用后不再逐样本清零。
+     *
+     * 误差状态转移 F=[[I,M],[0,I]] 与误差注入 G=[[J,0],[0,I]] 都是块结构，
+     * 协方差传播因此直接用 3×3 块运算（见 _propagate_covariance / _rotate_covariance），
+     * 不再构造 6×6 的 F/G。
+     *
+     * 约束：各块暂存每次使用前都被完整写满，因此无需初始化；_q 由 _update_gyr
+     * 每拍完整写入（含显式清零的右下 3×3 非对角块）。 */
+    matrix_t<3, 3> _jacobian{};   /* J_l(angle) */
+    matrix_t<3, 3> _skew{};       /* [v]x */
+    matrix_t<3, 3> _skew_sq{};    /* [v]x² = [v]x·[v]x */
+    matrix_t<3, 3> _rot{};        /* R_start */
+    matrix_t<3, 3> _avg_rot{};    /* A = R_start·J_l */
+    matrix_t<3, 3> _avg_rot_t{};  /* Aᵀ */
+    matrix_t<3, 3> _avg_rot_at{}; /* A·Aᵀ */
+    error_kf_t::covariance_t _q{};   /* 本拍过程噪声 Q */
+    matrix_t<6, 6> _p_prop{};        /* F·P·Fᵀ 或 G·P·Gᵀ，提交给 KF 前 */
+    matrix_t<3, 3> _m{};             /* 过渡耦合块 M = -A·dt，即 F 的右上块 */
+    matrix_t<3, 3> _m_t{};           /* Mᵀ；误差注入时复用为 Jᵀ */
+    matrix_t<3, 3> _p00{};           /* P 的 3×3 分块（对称，P10 由 P01 转置） */
+    matrix_t<3, 3> _p01{};
+    matrix_t<3, 3> _p10{};
+    matrix_t<3, 3> _p11{};
+    matrix_t<3, 3> _t1{};            /* 块乘法暂存 */
+    matrix_t<3, 3> _t2{};
+    matrix_t<3, 3> _t3{};
+
+    status_t _compute_left_jacobian(const vector3_t &angle);
+    status_t _load_p_blocks();  /* 取当前 P 的四个 3×3 块 */
+    status_t _propagate_covariance(); /* F·P·Fᵀ → _p_prop（3 次 3×3） */
+    status_t _rotate_covariance();    /* G·P·Gᵀ → _p_prop（3 次 3×3） */
+    static void _get_block(const matrix_t<6, 6> &src, std::size_t row0,
+                           std::size_t col0, matrix_t<3, 3> &dst);
+    static void _set_block(matrix_t<6, 6> &dst, std::size_t row0,
+                           std::size_t col0, const matrix_t<3, 3> &src);
 };
 
 } // namespace pyro

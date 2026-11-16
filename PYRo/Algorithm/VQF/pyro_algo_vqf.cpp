@@ -39,13 +39,6 @@ vqf_t::quaternion_t normalized(const vqf_t::quaternion_t &q)
     return result;
 }
 
-matrix_t<3, 3> rotation(const vqf_t::quaternion_t &q)
-{
-    matrix_t<3, 3> result;
-    arm_quaternion2rotation_f32(q.data(), result.data(), 1);
-    return result;
-}
-
 vector_t<3> rotate(const vqf_t::quaternion_t &q, const vector_t<3> &v)
 {
     const float w = q[0], x = q[1], y = q[2], z = q[3];
@@ -72,25 +65,6 @@ vqf_t::quaternion_t rotation_step(const vector_t<3> &angle)
         return normalized({1.0f, 0.5f * angle[0], 0.5f * angle[1], 0.5f * angle[2]});
     const float scale = sinf(0.5f * magnitude) / magnitude;
     return {cosf(0.5f * magnitude), scale * angle[0], scale * angle[1], scale * angle[2]};
-}
-
-// SO(3) 左雅可比，用于旋转积分及全局误差注入后的协方差重置。
-// J_l(v)=I+(1-cos|v|)/|v|²[v]x+(|v|-sin|v|)/|v|³[v]x²。
-matrix_t<3, 3> left_jacobian(const vector_t<3> &angle)
-{
-    const float squared = square(angle[0]) + square(angle[1]) + square(angle[2]);
-    float first = 0.5f - squared / 24.0f;
-    float second = 1.0f / 6.0f - squared / 120.0f;
-    if (squared > 1.0e-4f)
-    {
-        const float magnitude = sqrtf(squared);
-        first = (1.0f - cosf(magnitude)) / squared;
-        second = (magnitude - sinf(magnitude)) / (squared * magnitude);
-    }
-    const matrix_t<3, 3> skew{0.0f, -angle[2], angle[1],
-                              angle[2], 0.0f, -angle[0],
-                              -angle[1], angle[0], 0.0f};
-    return identity<3>() + skew * first + (skew * skew) * second;
 }
 
 // 将单位方向转向 +Z 的最短旋转向量，取水平两维作为倾斜新息。
@@ -156,15 +130,19 @@ status_t vqf_t::configure(const config_t &config)
         if (result != PYRO_OK)
             return result;
     }
-    const bool rest_changed = config.rest_bias_est_enabled != _config.rest_bias_est_enabled ||
+    /* 参数"变化"检测只在已初始化后有意义：首次 configure 时 _config 是默认构造值，
+     * 与调用方配置的差异并不是"热更新"，此时清空低通/可信历史毫无意义，
+     * 还会让 reset() 之后本该保留的启动时序看起来像被参数改动打断。
+     * （首次配置走下面的 reset()，历史本来就是空的。） */
+    const bool rest_changed = !first && (config.rest_bias_est_enabled != _config.rest_bias_est_enabled ||
         config.rest_filter_tau != _config.rest_filter_tau || config.rest_min_t != _config.rest_min_t ||
         config.rest_th_gyr != _config.rest_th_gyr || config.rest_th_acc != _config.rest_th_acc ||
-        config.bias_clip != _config.bias_clip;
-    const bool acc_changed = config.tau_acc != _config.tau_acc ||
+        config.bias_clip != _config.bias_clip);
+    const bool acc_changed = !first && (config.tau_acc != _config.tau_acc ||
         config.acc_noise != _config.acc_noise || config.acc_norm_tolerance != _config.acc_norm_tolerance ||
         config.acc_vibration_tolerance != _config.acc_vibration_tolerance ||
         config.acc_recovery_t != _config.acc_recovery_t ||
-        config.acc_nis_threshold != _config.acc_nis_threshold;
+        config.acc_nis_threshold != _config.acc_nis_threshold);
     if (rest_changed)
     {
         _rest_gyr_lp.reset();
@@ -308,6 +286,126 @@ status_t vqf_t::update(const imu_data_t &data)
     return batch_result;
 }
 
+/* 6×6 → 3×3 子块读/写（纯拷贝，无浮点运算）。 */
+void vqf_t::_get_block(const matrix_t<6, 6> &src, std::size_t row0, std::size_t col0,
+                       matrix_t<3, 3> &dst)
+{
+    for (std::size_t row = 0; row < 3; ++row)
+        for (std::size_t col = 0; col < 3; ++col)
+            dst(row, col) = src(row0 + row, col0 + col);
+}
+
+void vqf_t::_set_block(matrix_t<6, 6> &dst, std::size_t row0, std::size_t col0,
+                       const matrix_t<3, 3> &src)
+{
+    for (std::size_t row = 0; row < 3; ++row)
+        for (std::size_t col = 0; col < 3; ++col)
+            dst(row0 + row, col0 + col) = src(row, col);
+}
+
+/* 取当前 P 的四个 3×3 块。P 对称，因此 P10 = P01ᵀ（转置是纯拷贝，无舍入）。 */
+status_t vqf_t::_load_p_blocks()
+{
+    const error_kf_t::covariance_t &P = _error_kf.get_covariance();
+    _get_block(P, 0, 0, _p00);
+    _get_block(P, 0, 3, _p01);
+    _get_block(P, 3, 3, _p11);
+    if (matrix::transpose(matrix::view(_p01), matrix::view(_p10)) != ARM_MATH_SUCCESS)
+        return PYRO_ERROR;
+    return PYRO_OK;
+}
+
+/* P⁻ = F·P·Fᵀ，误差状态转移 F = [[I, M], [0, I]]：
+ *   F·P      = [[P00 + M·P10, P01 + M·P11], [P10, P11]]
+ *   (F·P)·Fᵀ = [[X00 + X01·Mᵀ, X01], [X10 + X11·Mᵀ, X11]]
+ * 又因 P 对称 ⇒ 结果对称 ⇒ X10 = X01ᵀ，于是只需 3 次 3×3 乘法：
+ *   X01 = P01 + M·P11,  r00 = P00 + M·P10 + X01·Mᵀ,  r01 = X01,
+ *   r11 = P11,          r10 = X01ᵀ
+ * MAC 数 81，通用 6×6 路径是 432（2 次乘法）＋一次 6×6 转置。
+ * 结果与通用路径只差浮点分组，后续 predict_covariance 会对称化并加 Q。 */
+status_t vqf_t::_propagate_covariance()
+{
+    if (_load_p_blocks() != PYRO_OK)
+        return PYRO_ERROR;
+    if (matrix::transpose(matrix::view(_m), matrix::view(_m_t)) != ARM_MATH_SUCCESS)
+        return PYRO_ERROR;
+    if (matrix::multiply(matrix::view(_m), matrix::view(_p11), matrix::view(_t1)) !=
+        ARM_MATH_SUCCESS)
+        return PYRO_ERROR;
+    for (std::size_t i = 0; i < 9; ++i)
+        _t2.data()[i] = _p01.data()[i] + _t1.data()[i]; /* X01 */
+    if (matrix::multiply(matrix::view(_m), matrix::view(_p10), matrix::view(_t1)) !=
+            ARM_MATH_SUCCESS ||
+        matrix::multiply(matrix::view(_t2), matrix::view(_m_t), matrix::view(_t3)) !=
+            ARM_MATH_SUCCESS)
+        return PYRO_ERROR;
+    for (std::size_t i = 0; i < 9; ++i)
+        _p00.data()[i] = (_p00.data()[i] + _t1.data()[i]) + _t3.data()[i]; /* r00 */
+    if (matrix::transpose(matrix::view(_t2), matrix::view(_p10)) != ARM_MATH_SUCCESS)
+        return PYRO_ERROR; /* r10 */
+    _set_block(_p_prop, 0, 0, _p00);
+    _set_block(_p_prop, 0, 3, _t2);
+    _set_block(_p_prop, 3, 0, _p10);
+    _set_block(_p_prop, 3, 3, _p11);
+    return PYRO_OK;
+}
+
+/* G·P·Gᵀ，误差注入 G = [[J, 0], [0, I]]：
+ *   (0,0) = J·P00·Jᵀ, (0,1) = J·P01, (1,0) = (J·P01)ᵀ, (1,1) = P11
+ * 3 次 3×3 乘法（通用路径是 2 次 6×6 + 一次转置）。 */
+status_t vqf_t::_rotate_covariance()
+{
+    if (_load_p_blocks() != PYRO_OK)
+        return PYRO_ERROR;
+    if (matrix::transpose(matrix::view(_jacobian), matrix::view(_m_t)) != ARM_MATH_SUCCESS)
+        return PYRO_ERROR;
+    if (matrix::multiply(matrix::view(_jacobian), matrix::view(_p00), matrix::view(_t1)) !=
+            ARM_MATH_SUCCESS ||
+        matrix::multiply(matrix::view(_t1), matrix::view(_m_t), matrix::view(_t2)) !=
+            ARM_MATH_SUCCESS ||
+        matrix::multiply(matrix::view(_jacobian), matrix::view(_p01), matrix::view(_t3)) !=
+            ARM_MATH_SUCCESS)
+        return PYRO_ERROR;
+    if (matrix::transpose(matrix::view(_t3), matrix::view(_t1)) != ARM_MATH_SUCCESS)
+        return PYRO_ERROR;
+    _set_block(_p_prop, 0, 0, _t2);
+    _set_block(_p_prop, 0, 3, _t3);
+    _set_block(_p_prop, 3, 0, _t1);
+    _set_block(_p_prop, 3, 3, _p11);
+    return PYRO_OK;
+}
+
+/* SO(3) 左雅可比，结果写入成员 _jacobian：
+ *   J_l(v) = I + (1-cos|v|)/|v|²·[v]x + (|v|-sin|v|)/|v|³·[v]x²
+ * 逐元素形式与原来的表达式 `identity + skew*first + (skew*skew)*second`
+ * 保持相同的乘加顺序，因此结果逐位不变。
+ * 返回码：矩阵乘法失败时返回错误（原实现走 operator*，失败被静默吞掉）。 */
+status_t vqf_t::_compute_left_jacobian(const vector3_t &angle)
+{
+    const float squared = square(angle[0]) + square(angle[1]) + square(angle[2]);
+    float first = 0.5f - squared / 24.0f;
+    float second = 1.0f / 6.0f - squared / 120.0f;
+    if (squared > 1.0e-4f)
+    {
+        const float magnitude = sqrtf(squared);
+        first = (1.0f - cosf(magnitude)) / squared;
+        second = (magnitude - sinf(magnitude)) / (squared * magnitude);
+    }
+    _skew(0, 0) = 0.0f;     _skew(0, 1) = -angle[2]; _skew(0, 2) = angle[1];
+    _skew(1, 0) = angle[2]; _skew(1, 1) = 0.0f;      _skew(1, 2) = -angle[0];
+    _skew(2, 0) = -angle[1]; _skew(2, 1) = angle[0]; _skew(2, 2) = 0.0f;
+    if (matrix::multiply(matrix::view(_skew), matrix::view(_skew),
+                         matrix::view(_skew_sq)) != ARM_MATH_SUCCESS)
+        return PYRO_ERROR;
+    for (std::size_t i = 0; i < 9; ++i)
+    {
+        const float identity_value = (i % 4U == 0U) ? 1.0f : 0.0f;
+        _jacobian.data()[i] =
+            (identity_value + _skew.data()[i] * first) + _skew_sq.data()[i] * second;
+    }
+    return PYRO_OK;
+}
+
 status_t vqf_t::_update_gyr(const vector3_t &gyr, float dt)
 {
     const vector3_t unbiased = gyr - _state.bias;
@@ -319,10 +417,32 @@ status_t vqf_t::_update_gyr(const vector3_t &gyr, float dt)
         const quaternion_t next_gyr = normalized(multiply(_state.gyr_quat, rotation_step(angle)));
         // R_true=Exp(δθ_global)R_nom，δθ_dot=-R_nom δb-R_nom n_g。
         // 平均旋转 A=R_start J_l(ω dt)，对恒角速度积分偏置耦合。
-        const auto A = rotation(multiply(_state.acc_quat, _state.gyr_quat)) * left_jacobian(angle);
-        const auto AAt = A * A.transpose();
-        auto F = identity<6>();
-        error_kf_t::covariance_t Q;
+        // 以下全部写入成员暂存（避免每样本构造/清零 matrix_t 临时量）。
+        const status_t jacobian_result = _compute_left_jacobian(angle);
+        if (jacobian_result != PYRO_OK)
+            return jacobian_result;
+        {
+            const quaternion_t r_start = multiply(_state.acc_quat, _state.gyr_quat);
+            arm_quaternion2rotation_f32(r_start.data(), _rot.data(), 1);
+        }
+        /* 显式检查返回码：原实现走 matrix_t::operator*，失败会被静默吞掉，
+         * 导致本拍用残缺的 A/Aᵀ 继续传播协方差。 */
+        if (matrix::multiply(matrix::view(_rot), matrix::view(_jacobian),
+                             matrix::view(_avg_rot)) != ARM_MATH_SUCCESS ||
+            matrix::transpose(matrix::view(_avg_rot), matrix::view(_avg_rot_t)) !=
+                ARM_MATH_SUCCESS ||
+            matrix::multiply(matrix::view(_avg_rot), matrix::view(_avg_rot_t),
+                             matrix::view(_avg_rot_at)) != ARM_MATH_SUCCESS)
+            return PYRO_ERROR;
+
+        error_kf_t::covariance_t &Q = _q;
+        /* 耦合块 M = -A·dt，即误差状态转移 F 的右上块。块传播只用到这一块，
+         * 不再构造 6×6 的 F。Q 的右下 3×3 非对角块本拍不参与计算，必须显式清零
+         * （原来靠默认构造清零）；其余元素由下面的循环完整覆盖。 */
+        for (std::size_t row = 0; row < 3; ++row)
+            for (std::size_t col = 0; col < 3; ++col)
+                _m(row, col) = -_avg_rot(row, col) * dt;
+        Q(3, 4) = Q(3, 5) = Q(4, 3) = Q(4, 5) = Q(5, 3) = Q(5, 4) = 0.0f;
         const float bias_rate = square(0.1f * deg_to_rad) / _config.bias_forgetting_time;
         const float gyro_variance = square(_config.gyro_noise_density * deg_to_rad) * dt;
         const float bias_variance = bias_rate * dt;
@@ -332,12 +452,20 @@ status_t vqf_t::_update_gyr(const vector3_t &gyr, float dt)
             Q(row + 3, row + 3) = bias_variance;
             for (std::size_t col = 0; col < 3; ++col)
             {
-                F(row, col + 3) = -A(row, col) * dt;
-                Q(row, col) += AAt(row, col) * bias_variance * square(dt) / 3.0f;
-                Q(row, col + 3) = Q(col + 3, row) = -0.5f * A(row, col) * bias_variance * dt;
+                /* 原式为 Q(row,col) += …（Q 初值 0）：对角项在上一行刚被赋成
+                 * gyro_variance，非对角项初值恒为 0，故等价于显式赋值。 */
+                const float previous = (row == col) ? Q(row, row) : 0.0f;
+                Q(row, col) =
+                    previous + _avg_rot_at(row, col) * bias_variance * square(dt) / 3.0f;
+                Q(row, col + 3) = Q(col + 3, row) =
+                    -0.5f * _avg_rot(row, col) * bias_variance * dt;
             }
         }
-        const status_t result = _error_kf.predict({}, F, Q);
+        /* P⁻ = F·P·Fᵀ 用块结构算（3 次 3×3 代替 2 次 6×6），再交给 KF 补 Q 并提交。 */
+        const status_t propagated = _propagate_covariance();
+        if (propagated != PYRO_OK)
+            return propagated;
+        const status_t result = _error_kf.predict_covariance({}, _p_prop, Q);
         _diagnostics = _error_kf.get_diagnostics();
         if (result != PYRO_OK)
             return result;
@@ -596,13 +724,15 @@ status_t vqf_t::_inject_error()
     const auto next_bias = _state.bias + vector3_t{delta[3], delta[4], delta[5]};
     if (!matrix::is_finite(next_acc) || !matrix::is_finite(next_bias))
         return PYRO_ERROR;
-    auto G = identity<6>();
-    const auto J = left_jacobian(angle);
-    for (std::size_t row = 0; row < 3; ++row)
-        for (std::size_t col = 0; col < 3; ++col)
-            G(row, col) = J(row, col);
-    const auto P = G * _error_kf.get_covariance() * G.transpose();
-    const status_t result = _error_kf.reset({}, P);
+    /* 误差注入：G = [[J_l, 0], [0, I]]，用块结构计算新的 P。 */
+    const status_t jacobian_result = _compute_left_jacobian(angle);
+    if (jacobian_result != PYRO_OK)
+        return jacobian_result;
+    /* P ← G·P·Gᵀ，G = [[J_l, 0], [0, I]]：块结构 3 次 3×3 乘法。 */
+    const status_t rotated = _rotate_covariance();
+    if (rotated != PYRO_OK)
+        return rotated;
+    const status_t result = _error_kf.reset({}, _p_prop);
     if (result != PYRO_OK)
         return result;
     _state.acc_quat = next_acc;
@@ -610,9 +740,8 @@ status_t vqf_t::_inject_error()
     return PYRO_OK;
 }
 
-vqf_t::state_t vqf_t::get_state() const
+void vqf_t::get_state(state_t &result) const
 {
-    state_t result;
     result.quat = multiply(_state.acc_quat, _state.gyr_quat);
     result.bias = _state.bias;
     result.error_covariance = _error_kf.get_covariance();
@@ -641,6 +770,12 @@ vqf_t::state_t vqf_t::get_state() const
     result.acc_corrections = _state.acc_corrections;
     result.acc_rejections = _state.acc_rejections;
     result.bias_diagnostics = _diagnostics;
+}
+
+vqf_t::state_t vqf_t::get_state() const
+{
+    state_t result;
+    get_state(result);
     return result;
 }
 

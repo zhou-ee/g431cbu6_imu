@@ -53,25 +53,31 @@ set(CMAKE_CXX_STANDARD 17)                   # PYRo 需要 C++17（DWT 用 inlin
 - `lsm6dsv_test.ioc`：`FDCAN1.StdFiltersNbr=1`（并加入 `FDCAN1.IPParameters`）
 - `Core/Src/fdcan.c`：`hfdcan1.Init.StdFiltersNbr = 1;`
 
-### 3.2 USART2：必须分配 RX/TX DMA 并打开中断（**需要你在 CubeMX 里加**，尚未配置）
+### 3.2 USART2：RX/TX DMA 与中断（**已配置**）
 
 UART 驱动用 `HAL_UARTEx_ReceiveToIdle_DMA()` 做不定长接收，要求该串口有 **RX DMA 通道**；
-非阻塞发送 `write(p, size)` 还要求 **TX DMA 通道**。当前 `Core/Src/usart.c` 的 `HAL_UART_MspInit()`
-里没有任何 DMA、`stm32g4xx_it.c` 里也没有 `USART2_IRQHandler`，因此：
+非阻塞发送 `write(p, size)` 还要求 **TX DMA 通道**。当前 CubeMX 生成代码**已经配好**：
 
-- `huart2.hdmarx == NULL` → `enable_rx_dma()` **直接返回 `PYRO_ERROR`**（驱动里已加空指针保护，不会跑飞），接收完全不可用；
-- `huart2.hdmatx == NULL` → 非阻塞发送**提前返回 `PYRO_ERROR`**（G4 HAL 在这种情况下会“静默成功”，把发送状态永久卡在 BUSY_TX，见 §5 第 15 条）。
+| 项 | 位置 | 配置 |
+|---|---|---|
+| `hdma_usart2_rx` | `Core/Src/usart.c` `HAL_UART_MspInit()` | `DMA1_Channel3` + `DMA_REQUEST_USART2_RX`，Normal，Byte |
+| `hdma_usart2_tx` | 同上 | `DMA1_Channel4` + `DMA_REQUEST_USART2_TX`，Normal，Byte |
+| 句柄绑定 | 同上 | `__HAL_LINKDMA(uartHandle, hdmarx/hdmatx, ...)` |
+| 中断 | `Core/Src/usart.c` / `Core/Src/dma.c` / `Core/Src/stm32g4xx_it.c` | `USART2_IRQn`、`DMA1_Channel3/4_IRQn` 均使能，优先级 5 |
 
-CubeMX 操作：`Connectivity → USART2 → DMA Settings → Add → USART2_RX` 与 `USART2_TX`
-（Mode: Normal，Peripheral/Mem 均为 Byte），再到 `NVIC Settings` 勾选
-`USART2 global interrupt` 与对应 DMA 通道中断，优先级填 **≥ 5**
-（必须 ≥ `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY = 5`，否则 ISR 里不能调用 FreeRTOS API）。
-生成代码后应能在 `usart.c` 看到 `__HAL_LINKDMA(...hdmarx/hdmatx...)`、
-在 `stm32g4xx_it.c` 看到 `USART2_IRQHandler` 与 `DMAx_Channelx_IRQHandler`，重新编译即可。
+优先级 5 恰好等于 `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY = 5`，满足
+FreeRTOS "ISR 不得高于该值"的要求（数值 ≥ 5 才允许调用 `FromISR` API）。
+
+历史上本节写的是"尚未配置、需要手工加 DMA"。该结论已过期：动手前请以
+`Core/Src/usart.c` 的 `HAL_UART_MspInit()` 实际内容为准；若 CubeMX 重新生成后
+`huart2.hdmarx/hdmatx` 又变回 `NULL`，驱动侧仍会**提前返回 `PYRO_ERROR`** 而不会跑飞
+（见 §5 第 5、15 条），现象是"UART 完全不通但没有 HardFault"。
 
 ### 3.3 调度器必须启动，否则 CAN/Lock/Task 会把中断永久关掉
 
-`Core/Src/main.c` 里的 `MX_FREERTOS_Init()` / `osKernelStart()` 目前是注释状态。**这不是可选项**：
+`Core/Src/main.c` 里的 `MX_FREERTOS_Init()` / `osKernelStart()` **已经启用**，入口
+`StartDefaultTask` 调用 `imu_module_init()` 拉起采集链路。下面这些约束仍然成立——
+任何"临时把调度器关掉调试"的做法都会踩到：
 
 - FreeRTOS 的 Cortex-M4 端口里 `uxCriticalNesting` 在调度器启动前是哨兵值 `0xaaaaaaaa`
   （`port.c`），只有 `xPortStartScheduler()` 才会把它清 0；
@@ -92,9 +98,11 @@ CubeMX 操作：`Connectivity → USART2 → DMA Settings → Add → USART2_RX`
 
 ### 3.5 堆空间
 
-- FreeRTOS 主堆 `configTOTAL_HEAP_SIZE = 3072`（`Core/Inc/FreeRTOSConfig.h`）。
+- FreeRTOS 主堆 `configTOTAL_HEAP_SIZE = 12288`（`Core/Inc/FreeRTOSConfig.h`）。
   UART 的 `std::map`/`std::vector`/`std::function` 节点、任务栈、信号量都从这里分配
-  （每个互斥锁约 88B、`rw_lock` 一次要 3 个信号量约 264B、每个任务至少 512B），**建议按业务调大到 6~8KB**。
+  （每个互斥锁约 88B、`rw_lock` 一次要 3 个信号量约 264B、每个任务至少 512B）。
+  当前 `defaultTask` 与 `imu` 任务各占 1024 词（4 KB），实测剩余最低 3176 B——
+  再加任务或队列前需要扩堆。
 - DMA 堆 `configTOTAL_DMA_HEAP_SIZE = 2048`（`Core/Memory/pyro_core_dma_heap.c`）。
   按 heap_4 规则 2048B 实际可用 2040B，每个 512B 缓冲实占 520B（含 8B 块头）：
   一个串口需要 2 个缓冲 = 1040B 够用，**再加一个串口就不够了**（需 ≥ 2×串口数×520B）。
