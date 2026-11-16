@@ -16,13 +16,12 @@ imu_base_drv::~imu_base_drv() = default;
 bool imu_base_drv::calibrate() {
     const uint16_t target = (_data.cfg.calibrate_times > 0U) ? _data.cfg.calibrate_times : 2000U;
     const imu_cali_t previous_cali = _data.cali;
-    const imu_direct_t previous_direct = _data.cfg.direct;
 
-    /* 偏置存储在传感器原坐标系。标定读取未扣偏置、未换轴的新样本。 */
+    /* 偏置存储在器件原坐标系。驱动的输出契约即为器件坐标系，标定天然读到的
+     * 就是未扣偏置的新样本，无需临时更改任何配置。 */
     _data.cali.gx_offset = 0.0f;
     _data.cali.gy_offset = 0.0f;
     _data.cali.gz_offset = 0.0f;
-    _data.cfg.direct = imu_direct_t::NONE;
     assume_gyro_point(_data.gyro.count);
     assume_acc_point(_data.acc.count);
 
@@ -63,7 +62,6 @@ bool imu_base_drv::calibrate() {
         } else if (++guard > 5000000U) {
             /* 以实际标定进度检测停滞，覆盖仅一路有数据的情况。 */
             _data.cali = previous_cali;
-            _data.cfg.direct = previous_direct;
             return false;
         }
     }
@@ -74,7 +72,6 @@ bool imu_base_drv::calibrate() {
     _data.cali.gy_offset = static_cast<float>(sum_gyro[1] * inv_g);
     _data.cali.gz_offset = static_cast<float>(sum_gyro[2] * inv_g);
     _data.cali.g_norm    = static_cast<float>(sum_norm * inv_a);
-    _data.cfg.direct = previous_direct;
 
     return true;
 }

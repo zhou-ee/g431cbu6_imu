@@ -29,8 +29,6 @@ bool xl_odr_code(uint16_t hz, uint8_t &code);
 bool gy_odr_code(uint16_t hz, uint8_t &code);
 bool xl_fs_code(uint16_t g, uint8_t &code, float &full_scale);
 bool gy_fs_code(uint16_t dps, uint8_t &code, float &dps_per_lsb);
-void direct_indices(imu_direct_t d, uint8_t idx[3], bool neg[3]);
-void remap_axis(float v[3], const uint8_t idx[3], const bool neg[3]);
 
 } /* namespace */
 
@@ -182,10 +180,6 @@ bool lsm6dsv16x_drv_t::read_direct() {
     }
 
     /* 两路各自组装 1 个样本（直读路径独立实现，不借道 FIFO 字格式）*/
-    uint8_t idx[3] = {0U, 1U, 2U};
-    bool    neg[3] = {false, false, false};
-    direct_indices(_data.cfg.direct, idx, neg);
-
     /* 追加到样本流：满时自动覆盖最旧的未消费样本，指针总是有效 */
     gyro_sample_t *gp = gyro_alloc();
     acc_sample_t  *ap = acc_alloc();
@@ -197,7 +191,6 @@ bool lsm6dsv16x_drv_t::read_direct() {
     g.Gyro[0] = (static_cast<float>(raw[1]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gx_offset;
     g.Gyro[1] = (static_cast<float>(raw[2]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gy_offset;
     g.Gyro[2] = (static_cast<float>(raw[3]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gz_offset;
-    remap_axis(g.Gyro, idx, neg);
 
     /* 加速度：g → m/s² */
     acc_sample_t &a = *ap;
@@ -206,7 +199,6 @@ bool lsm6dsv16x_drv_t::read_direct() {
     a.Accel[0] = static_cast<float>(raw[4]) * acc_lsb;
     a.Accel[1] = static_cast<float>(raw[5]) * acc_lsb;
     a.Accel[2] = static_cast<float>(raw[6]) * acc_lsb;
-    remap_axis(a.Accel, idx, neg);
     return true;
 }
 
@@ -317,11 +309,6 @@ void lsm6dsv16x_drv_t::fifo_parse_word(const uint8_t *word) {
             s.Gyro[0] = (static_cast<float>(raw[0]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gx_offset;
             s.Gyro[1] = (static_cast<float>(raw[1]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gy_offset;
             s.Gyro[2] = (static_cast<float>(raw[2]) * gyro_lsb * DEG_TO_RAD) - _data.cali.gz_offset;
-
-            uint8_t idx[3] = {0U, 1U, 2U};
-            bool    neg[3] = {false, false, false};
-            direct_indices(_data.cfg.direct, idx, neg);
-            remap_axis(s.Gyro, idx, neg);
             break;
         }
 
@@ -334,11 +321,6 @@ void lsm6dsv16x_drv_t::fifo_parse_word(const uint8_t *word) {
             s.Accel[0] = static_cast<float>(raw[0]) * acc_lsb;
             s.Accel[1] = static_cast<float>(raw[1]) * acc_lsb;
             s.Accel[2] = static_cast<float>(raw[2]) * acc_lsb;
-
-            uint8_t idx[3] = {0U, 1U, 2U};
-            bool    neg[3] = {false, false, false};
-            direct_indices(_data.cfg.direct, idx, neg);
-            remap_axis(s.Accel, idx, neg);
             break;
         }
 
@@ -425,35 +407,6 @@ bool gy_fs_code(uint16_t dps, uint8_t &code, float &dps_per_lsb) {
         case 4000U: code = CTRL6_FS_G_4000dps; dps_per_lsb = Sensitivity::G_4000dps; return true;
         default:    return false;
     }
-}
-
-/* ---------------- 安装方向：轴交换 + 符号（与 PYRo INS 的 DIRECT_1..8 约定一致） ---------------- */
-
-void direct_indices(imu_direct_t d, uint8_t idx[3], bool neg[3]) {
-    idx[0] = 0U; idx[1] = 1U; idx[2] = 2U;
-    neg[0] = false; neg[1] = false; neg[2] = false;
-
-    switch (d) {
-        case imu_direct_t::DIRECT_2: idx[0] = 1U; idx[1] = 0U; neg[1] = true; break;
-        case imu_direct_t::DIRECT_3: neg[0] = true; neg[1] = true; break;
-        case imu_direct_t::DIRECT_4: idx[0] = 1U; idx[1] = 0U; neg[0] = true; break;
-        case imu_direct_t::DIRECT_5: neg[1] = true; neg[2] = true; break;
-        case imu_direct_t::DIRECT_6: idx[0] = 1U; idx[1] = 0U; neg[0] = true; neg[1] = true; neg[2] = true; break;
-        case imu_direct_t::DIRECT_7: neg[0] = true; neg[2] = true; break;
-        case imu_direct_t::DIRECT_8: idx[0] = 1U; idx[1] = 0U; neg[2] = true; break;
-        case imu_direct_t::DIRECT_1:
-        case imu_direct_t::NONE:
-        default: break; /* 单位映射：不换轴、不取反 */
-    }
-}
-
-/* ---------------- 轴序变换：按 idx 换轴、按 neg 取反（原地修改 3 元素向量） ---------------- */
-
-void remap_axis(float v[3], const uint8_t idx[3], const bool neg[3]) {
-    const float t[3] = {v[idx[0]], v[idx[1]], v[idx[2]]};   /* 先取出，避免原地覆盖 */
-    v[0] = neg[0] ? -t[0] : t[0];
-    v[1] = neg[1] ? -t[1] : t[1];
-    v[2] = neg[2] ? -t[2] : t[2];
 }
 
 } /* namespace */

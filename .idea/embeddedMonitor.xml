@@ -30,7 +30,11 @@
         <PersistedWatchItem>
           <option name="expr" value="imu_service_yaw" />
         </PersistedWatchItem>
+        <PersistedWatchItem>
+          <option name="expr" value="s_attitude" />
+        </PersistedWatchItem>
       </list>
     </option>
+    <option name="watchRefreshFreq" value="15" />
   </component>
 </project>

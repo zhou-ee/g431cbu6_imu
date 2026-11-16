@@ -38,6 +38,7 @@
 
 #include "imu_service.h"
 
+#include "imu_mount.h"
 #include "lsm6dsv16x_drv.h"
 #include "pyro_dwt_drv.h"
 #include "pyro_task.h"
@@ -75,6 +76,8 @@ volatile float    imu_service_yaw          = 0.0f;
 volatile float    imu_service_bias_rps[3]  = {0.0f, 0.0f, 0.0f};
 volatile uint32_t imu_service_rest         = 0U;
 volatile float    imu_service_rest_t       = 0.0f;
+volatile uint32_t imu_service_heading_zeroed  = 0U;
+volatile uint32_t imu_service_heading_quality = 0U;
 volatile float    imu_service_acc_confidence = 0.0f;
 volatile float    imu_service_acc_nis       = 0.0f;
 volatile uint32_t imu_service_acc_rejected  = 0U;
@@ -96,11 +99,10 @@ const imu_cfg_t k_imu_cfg = {
     2000U,                  /* gyro_range     ：±2000 dps */
     1920U,                  /* gyro_freq      ：1920 Hz */
     true,                   /* fifo_en        ：true=FIFO 批量；false=寄存器直读回退 */
-    imu_direct_t::DIRECT_1, /* direct         ：按实际安装方向改这里 */
 };
 
 /* ======================= VQF 配置 =======================
- * 门限按本板静止实测噪声设定：驱动已做单位换算与安装方向映射，
+ * 门限按本板静止实测噪声设定：驱动只做单位换算与零偏扣除，输出为器件坐标系，
  * 静止时角速度残余约 1 °/s 量级（零偏未扣除），故 rest_th_gyr 放到 5 °/s。
  * 加速度静止波动约 0.2~0.3 m/s²，rest_th_acc 放到 1.0 留余量。
  * bias_clip 必须 ≥ rest_th_gyr，否则低通值被提前截断，静止永不成立。 */
@@ -117,6 +119,20 @@ const pyro::vqf_t::config_t k_vqf_cfg = [] {
     return c;
 }();
 
+/* ======================= 航向归零门控 =======================
+ * 6 轴 VQF 的航向不可观测，yaw 零点必须由产品定义。建立零点需要三件事同时成立：
+ *   ① state.initialized   —— 可信重力方向已建立，四元数才有意义；
+ *   ② state.rest_detected —— 已含 rest_min_t 的连续静止确认（VQF 内部判定）；
+ *   ③ bias_sigma 低于门限 —— 该量是零偏协方差三轴的上界，而竖直轴只在静止观测下
+ *                            可观测，也正是产生 yaw 漂移的那一轴。未收敛就归零，
+ *                            零点会带上截至该时刻的累积漂移，且后续静止观测会追溯
+ *                            修正 yaw 误差，使发布 yaw 在收敛过程中继续移动。
+ *                            （零偏收敛后漂移即停止，并非长期漂移。）
+ * 再加超时兜底，避免产品在运动中被开机时永远给不出可信 yaw。
+ * 注意量纲：state.bias_sigma 为 rad/s，而 config.bias_sigma_init 为 °/s。 */
+constexpr float    k_bias_sigma_ok_rps  = 0.005f;  /* rad/s，≈0.29 °/s */
+constexpr uint32_t k_zero_timeout_round = 5000U;   /* 5 s @1 kHz */
+
 /* ======================= 板级绑定 ======================= */
 /* 片选由产品装配层绑定（CubeMX 中 PA4 初始为高）。换芯片/换板只改这两行。 */
 GPIO_TypeDef *const k_cs_port = GPIOA;
@@ -131,12 +147,28 @@ lsm6dsv16x_drv_t s_imu(k_imu_cfg, s_bus);
 /* VQF/ESKF 实例采用固定存储，静态区分配。 */
 pyro::vqf_t s_vqf;
 
+/* ======================= 装配归一化 =======================
+ * 安装方向配置与映射表见 Module/Config/imu_mount.h。器件驱动只输出器件坐标系的
+ * 物理量，映射在快照写入点完成（P3）。参数在初始化时算一次，热路径只做查表与乘法。 */
+float s_m_inv[4] = {1.0f, 0.0f, 0.0f, 0.0f}; /* m 的逆四元数（姿态换系右乘用） */
+
+/* 最新解包物理量（器件坐标系），供调试镜像按装配系输出 */
+float s_last_acc_dev[3]  = {0.0f, 0.0f, 0.0f};
+float s_last_gyro_dev[3] = {0.0f, 0.0f, 0.0f};
+
 /* 姿态快照：采集任务写、其他任务读。
  * 用版本号（seqlock）保证读方拿到的一定是完整的一次更新：
  *   写方：seq++（变奇数=更新中）→ 写结构体 → seq++（变偶数=稳定）
  *   读方：读 seq 为偶数 → 拷贝 → 再读 seq，未变则有效，否则重试 */
 imu_attitude_t s_attitude{};
 volatile uint32_t s_attitude_seq = 0U;
+
+/* ZYX 偏航角（rad）。欧拉角导出与航向归零共用，保持唯一真源。 */
+float quat_yaw_rad(const float q[4])
+{
+    return std::atan2(2.0f * (q[0] * q[3] + q[1] * q[2]),
+                      1.0f - 2.0f * (q[2] * q[2] + q[3] * q[3]));
+}
 
 /* 四元数 → 欧拉角（ZYX 顺序，°）。仅用于对外快照与调试观测。 */
 void quat_to_euler(const float q[4], float &roll, float &pitch, float &yaw)
@@ -153,9 +185,36 @@ void quat_to_euler(const float q[4], float &roll, float &pitch, float &yaw)
     if (sinp < -1.0f) { sinp = -1.0f; }
     pitch = std::asin(sinp) * rad_to_deg;
 
-    const float siny_cosp = 2.0f * (w * z + x * y);
-    const float cosy_cosp = 1.0f - 2.0f * (y * y + z * z);
-    yaw = std::atan2(siny_cosp, cosy_cosp) * rad_to_deg;
+    yaw = quat_yaw_rad(q) * rad_to_deg;
+}
+
+/* ======================= 航向归零 =======================
+ * 只把 yaw 归零，roll/pitch 不动（重力参考不丢）：
+ *   ✗ q0⁻¹ ⊗ q       —— 会把整个姿态打平，产品失去"水平"概念
+ *   ✓ Rz(-yaw0) ⊗ q  —— 左乘纯偏航，ZYX 约定下恰好只加在 yaw 上
+ * 实现位置为纯输出端后处理，不修改 VQF 内部状态——内部 acc_reference 与
+ * last_acc_lp 活在 gyr_quat 张成的近惯性系里，改内部姿态会破坏门控历史。
+ * VQF 重建时间基准（reset / tick_s 改变）后世界系重建，零点必须一并作废。 */
+struct heading_ref_t
+{
+    float   yaw0    = 0.0f;  /* 归零时刻的 yaw，rad */
+    bool    zeroed  = false;
+    uint8_t quality = 0U;
+};
+
+heading_ref_t s_heading{};
+uint32_t      s_zero_wait = 0U;
+
+/* 左乘 Rz(-yaw0)，只改 yaw 分量。 */
+void apply_heading_zero(float q[4], float yaw0)
+{
+    const float h = 0.5f * yaw0;
+    const float c = std::cos(h), s = std::sin(h);
+    const float w = q[0], x = q[1], y = q[2], z = q[3];
+    q[0] = c * w + s * z;
+    q[1] = c * x + s * y;
+    q[2] = c * y - s * x;
+    q[3] = c * z - s * w;
 }
 
 /* ======================= 采集 + 融合任务 ======================= */
@@ -181,6 +240,10 @@ class imu_task_t final : public pyro::task_base_t
             return pyro::PYRO_ERROR;
         }
 
+        /* 装配归一化参数：由 imu_mount.h 的正向表导出，只算一次。
+         * 换安装方向改 k_imu_direct 即可，驱动侧无需改动。 */
+        mount_quat_inverse(k_imu_direct, s_m_inv);
+
         const pyro::status_t ret = s_vqf.configure(k_vqf_cfg);
         imu_service_vqf_ready = (ret == pyro::PYRO_OK) ? 1 : 0;
         return ret;
@@ -204,20 +267,20 @@ class imu_task_t final : public pyro::task_base_t
                 const uint8_t ng = data.gyro.count;
                 const uint8_t na = data.acc.count;
 
-                /* 观测用：最新一帧原始物理量 */
+                /* 观测用：缓存最新一帧原始物理量（器件坐标系，装配归一化后再输出） */
                 if (ng != 0U)
                 {
                     const gyro_sample_t &g = data.gyro.cur();
-                    imu_service_gyro_rps[0] = g.Gyro[0];
-                    imu_service_gyro_rps[1] = g.Gyro[1];
-                    imu_service_gyro_rps[2] = g.Gyro[2];
+                    s_last_gyro_dev[0] = g.Gyro[0];
+                    s_last_gyro_dev[1] = g.Gyro[1];
+                    s_last_gyro_dev[2] = g.Gyro[2];
                 }
                 if (na != 0U)
                 {
                     const acc_sample_t &a = data.acc.cur();
-                    imu_service_accel_mps2[0] = a.Accel[0];
-                    imu_service_accel_mps2[1] = a.Accel[1];
-                    imu_service_accel_mps2[2] = a.Accel[2];
+                    s_last_acc_dev[0] = a.Accel[0];
+                    s_last_acc_dev[1] = a.Accel[1];
+                    s_last_acc_dev[2] = a.Accel[2];
                 }
 
                 /* ---- ② 融合：单任务下环形缓冲在本段执行期间不会被写入，
@@ -248,40 +311,75 @@ class imu_task_t final : public pyro::task_base_t
                 ++imu_service_algo_rounds;
 
                 /* ---- ④ 姿态快照：写全本地结构体后用 seqlock 发布 ---- */
-                float q[4];
-                float sq = 0.0f;
-                for (uint8_t i = 0U; i < 4U; ++i)
-                {
-                    q[i] = state.quat[i];
-                    sq += q[i] * q[i];
-                }
 
+                /* ④-1 装配归一化：器件系 → 安装系。
+                 * 换系在归零之前，因为航向零点是【安装系】下的产品定义。
+                 * 机体系向量（含零偏）都要换，漏一个即与四元数不同系。 */
+                float q[4];
+                for (uint8_t i = 0U; i < 4U; ++i) { q[i] = state.quat[i]; }
+                quat_to_install(q, s_m_inv);
+
+                float gyro_inst[3] = {s_last_gyro_dev[0], s_last_gyro_dev[1], s_last_gyro_dev[2]};
+                float acc_inst[3]  = {s_last_acc_dev[0],  s_last_acc_dev[1],  s_last_acc_dev[2]};
+                float bias_inst[3] = {state.bias[0], state.bias[1], state.bias[2]};
+                mount_apply(gyro_inst, k_imu_direct);
+                mount_apply(acc_inst,  k_imu_direct);
+                mount_apply(bias_inst, k_imu_direct);
+
+                /* ④-2 建立航向零点（一次性）。yaw0 取自本拍，故归零那一拍输出 yaw 恰为 0。 */
+                if (!s_heading.zeroed)
+                {
+                    const bool settled = state.initialized && state.rest_detected &&
+                                         (state.bias_sigma < k_bias_sigma_ok_rps);
+                    const bool fallback =
+                        (++s_zero_wait >= k_zero_timeout_round) && state.initialized;
+                    if (settled || fallback)
+                    {
+                        s_heading.yaw0    = quat_yaw_rad(q);
+                        s_heading.zeroed  = true;
+                        s_heading.quality = settled ? 1U : 2U;
+                    }
+                }
+                if (s_heading.zeroed) { apply_heading_zero(q, s_heading.yaw0); }
+
+                float sq = 0.0f;
+                for (uint8_t i = 0U; i < 4U; ++i) { sq += q[i] * q[i]; }
+
+                /* ④-3 欧拉角从【换系 + 归零之后】的四元数导出（欧拉角不是线性量） */
                 float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
                 quat_to_euler(q, roll, pitch, yaw);
 
                 imu_attitude_t next{};
                 for (uint8_t i = 0U; i < 4U; ++i) { next.quat[i] = q[i]; }
-                for (uint8_t i = 0U; i < 3U; ++i) { next.bias[i] = state.bias[i]; }
+                for (uint8_t i = 0U; i < 3U; ++i) { next.bias[i] = bias_inst[i]; }
                 next.roll   = roll;
                 next.pitch  = pitch;
                 next.yaw    = yaw;
                 next.rest_t = state.rest_t;
                 next.rest   = state.rest_detected;
                 next.valid  = state.initialized;
+                next.heading_zeroed  = s_heading.zeroed;
+                next.heading_quality = s_heading.quality;
 
                 ++s_attitude_seq; /* 奇数：更新中 */
                 s_attitude = next;
                 ++s_attitude_seq; /* 偶数：稳定 */
 
-                /* 调试观测镜像 */
+                /* ④-4 调试观测镜像：与快照同坐标系、同零点 */
                 for (uint8_t i = 0U; i < 4U; ++i) { imu_service_quat[i] = q[i]; }
-                for (uint8_t i = 0U; i < 3U; ++i) { imu_service_bias_rps[i] = state.bias[i]; }
+                for (uint8_t i = 0U; i < 3U; ++i) {
+                    imu_service_bias_rps[i]   = bias_inst[i];
+                    imu_service_gyro_rps[i]   = gyro_inst[i];
+                    imu_service_accel_mps2[i] = acc_inst[i];
+                }
                 imu_service_quat_norm = std::sqrt(sq);
                 imu_service_roll      = roll;
                 imu_service_pitch     = pitch;
                 imu_service_yaw       = yaw;
                 imu_service_rest      = state.rest_detected ? 1U : 0U;
                 imu_service_rest_t    = state.rest_t;
+                imu_service_heading_zeroed  = s_heading.zeroed ? 1U : 0U;
+                imu_service_heading_quality = s_heading.quality;
                 imu_service_acc_confidence = state.acc_confidence;
                 imu_service_acc_nis = state.acc_nis;
                 imu_service_acc_rejected = state.acc_rejected ? 1U : 0U;

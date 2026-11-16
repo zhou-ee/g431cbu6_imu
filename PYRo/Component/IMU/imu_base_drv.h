@@ -2,26 +2,17 @@
 #define __IMU_BASE_DRV_H__
 #include <cstdint>
 
+/* 物理量一律为【器件坐标系】（LSM6DSV16X 的 X/Y/Z，与输出原码一一对应）。
+ * 板级装配方向映射不属于器件契约，由产品装配层在输出端完成，见
+ * Module/Config/imu_mount.h。 */
 struct acc_sample_t {
     uint32_t timestamp;   /* 器件时间戳计数器原始值（tick），见上方说明 */
-    float Accel[3];       /* 单位 m/s²       */
+    float Accel[3];       /* 器件坐标系，单位 m/s² */
 };
 
 struct gyro_sample_t {
     uint32_t timestamp;
-    float Gyro[3];
-};
-
-enum class imu_direct_t : uint8_t {
-    NONE     = 0,
-    DIRECT_1 = 1,
-    DIRECT_2 = 2,
-    DIRECT_3 = 3,
-    DIRECT_4 = 4,
-    DIRECT_5 = 5,
-    DIRECT_6 = 6,
-    DIRECT_7 = 7,
-    DIRECT_8 = 8
+    float Gyro[3];        /* 器件坐标系，单位 rad/s */
 };
 
 struct imu_cfg_t {
@@ -32,14 +23,14 @@ struct imu_cfg_t {
     uint16_t gyro_range{};  // 单位 dps
     uint16_t gyro_freq{};   // 单位 Hz
     bool fifo_en{};
-    imu_direct_t direct = imu_direct_t::NONE;
 };
 
 struct imu_cali_t {
+    /* 陀螺静态零偏，器件坐标系，rad/s。标定在器件系进行（见 calibrate()）。 */
     float gx_offset = -0.010767111;
     float gy_offset = 0.013010208;
     float gz_offset =-0.0014672983;
-    float g_norm;
+    float g_norm;      /* 静止加速度模长，m/s² */
 };
 
 /**
@@ -103,6 +94,8 @@ struct sample_stream_t {
 };
 
 struct imu_data_t {
+    /* 全部物理量为【器件坐标系】。驱动只做单位换算与器件零偏扣除，
+     * 板级装配方向映射由产品装配层在输出端完成。 */
     /**
      * 两路样本流（陀螺 / 加速度）。
      * 取样本：acc.at(i)/acc.cur()、gyro.at(i)/gyro.cur()；

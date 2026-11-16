@@ -4,6 +4,7 @@ add_library(IMUProduct OBJECT
 
 target_include_directories(IMUProduct PUBLIC
         Application
+        Config
         IMU)
 
 target_link_libraries(IMUProduct PUBLIC PYRo)
