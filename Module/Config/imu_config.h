@@ -61,13 +61,28 @@ constexpr uint32_t kPublishPeriodMs = 1U;  /* 1 kHz */
 constexpr bool     kCanLoopbackSelfTest = false;
 
 /* ============================ 任务与资源 ============================
- * 两个常驻任务都在 FreeRTOS 堆（12 KB）里。层级优先级：采集/融合高于发布，
- * 发布可以晚一拍，采样不能积压。
- * 发布任务只做"取快照 → 编码 → 提交"，调用深度浅，384 词（1.5 KB）留有余量；
- * 采集/融合任务承载驱动等待与 ESKF，保留 1024 词（4 KB）。
- * 两者的实际余量由 imu_service_ins_stack_free / imu_pub_stack_free 观测。 */
-constexpr uint16_t kInsTaskStackWords       = 1024U;
-constexpr uint16_t kPublisherTaskStackWords = 384U;
+ * 三个常驻任务都在 FreeRTOS 堆（12 KB）里：
+ *   ins_cap  —— 只做 read()（FIFO → 环形缓冲），1 ms 硬周期，最高优先级
+ *   ins_algo —— 只做 update()（融合 + 快照发布），尽力而为，低于采集
+ *   imu_pub  —— 只做"取快照 → 编码 → 提交"，与 ins_algo 同级
+ *
+ * 为什么采集与算法拆开（2026-11-16 版，在 SPSC 环形缓冲落地之后）：
+ *   ① 采集周期不再被融合耗时打穿：update() 峰值再高也只降低姿态更新率；
+ *   ② 这是提高 ODR 的前提——7680 Hz 下每拍约 7.7 样本/路，单任务必然超预算；
+ *   ③ 拆分的安全前提是 sample_stream_t 已改为 SPSC（索引所有权分离 +
+ *      publish 屏障），因此【全程不需要任何 taskENTER_CRITICAL】。
+ *      旧实现曾在算法侧用临界区，把 BASEPRI 提到优先级 5，而 SPI1/DMA1_Ch1/2
+ *      的 NVIC 优先级也是 5，导致 DMA 完成中断被屏蔽、采集从 1 kHz 掉到 254 Hz。
+ *
+ * 栈：取值由【实测高水位】决定，不是拍脑袋。
+ *   采集任务只承载 read() 的两段 DMA 等待与 TAG 解包，实测高水位仅约 89 词
+ *   （512 词栈时 cap_stack_free = 423），取 256 词留近 3 倍余量；
+ *   融合任务不再承担 read()，承载 ESKF 与快照发布，取 768 词
+ *   （单任务版采集+融合合计高水位约 574 词，拆分后 read() 部分移出）。
+ * 这两个数字必须在改动后重新核对 cap_stack_free / ins_stack_free 是否仍 >100 词。 */
+constexpr uint16_t kCapTaskStackWords        = 256U;
+constexpr uint16_t kInsTaskStackWords        = 768U;
+constexpr uint16_t kPublisherTaskStackWords  = 384U;
 constexpr uint32_t kCpuMhz = 170U;         /* DWT 周期 → 微秒换算 */
 
 /* 板级绑定：片选由产品装配层决定（CubeMX 中 PA4 初始为高）。 */

@@ -38,63 +38,98 @@ struct imu_cali_t {
     float g_norm = 9.80665f;
 };
 
+/* ============================ 顺序屏障 ============================
+ * SPSC 的正确性只依赖"索引与数据的可见顺序"，不依赖互斥。
+ * 单核 Cortex-M4 上生产者与消费者同核，观察自己的写入天然按程序序可见，
+ * 因此真正要防的是【编译器重排】；ARM 目标额外发一条 dmb sy 作为架构级
+ * 保证（将来若移植到多核必须保留它）。主机侧（g++/clang，无 __arm__）
+ * 退化为纯编译器屏障，保证主机回归可跑。 */
+#if defined(__arm__) || defined(__ARM_ARCH)
+#define PYRO_STREAM_FENCE() __asm__ __volatile__("dmb sy" ::: "memory")
+#elif defined(__GNUC__) || defined(__clang__)
+#define PYRO_STREAM_FENCE() __asm__ __volatile__("" ::: "memory")
+#else
+#define PYRO_STREAM_FENCE() ((void)0)
+#endif
+
 /**
-     * 单路样本流（回绕环形缓冲的对外视图）。
- * 逻辑顺序旧 → 新：count 个未消费样本里，下标 0 最旧、count-1 最新。
- *
- * 物理上数据可能分两段（尾部 + 头部），一律用 at()/cur() 取值，它们处理回绕。
- * 生产侧（驱动）用 push() 追加（满时覆盖最旧），上层用 assume_*() 归还消费数量。
- */
+     * 单路样本流：单生产者/单消费者（SPSC）回绕环形缓冲。
+     *
+     * ============================ 所有权 ============================
+     * 【每个索引只有一个写者】，这是无需任何临界区的前提：
+     *   tail —— 只由生产者（驱动 read()）写；下一个可写槽
+     *   head —— 只由消费者（上层 assume_*_point）写；最旧未消费样本
+     * 未消费数由 (tail - head) 算出，不再单独存储 —— 旧实现里的 count 被双方
+     * 读改写，是数据竞争的来源（丢失更新 + 半写样本被看见）。
+     *
+     * ============================ 发布顺序 ============================
+     * 生产者：reserve() 拿槽 → 原地写满 payload → publish() 才移动 tail。
+     * 消费者：available() 取一批快照 → at()/cur() 读 payload → release()。
+     * 屏障保证"数据先于索引可见"，因此消费者绝不会看到半写的样本；
+     * 最坏情况只是暂时看不到最新样本（available 偏小），安全性单调。
+     *
+     * ============================ 满时策略 ============================
+     * 满则【丢弃新样本】：reserve() 返回 nullptr，由调用方计入 err_data。
+     * 不采用"覆盖最旧"——覆盖必须移动 head，而 head 属于消费者；
+     * 让生产者写 head 就等于退回需要加锁的设计。
+     * 副作用：err_data 成为纯粹的"背压丢样"计数，不再与器件 FIFO 溢出混同。
+     *
+     * 约束：capacity 必须是 2 的幂（用掩码代替取模）；需留一个哨兵槽判别满，
+     *       故实际可用深度 = capacity - 1。
+     */
 template <typename T>
 struct sample_stream_t {
-    T*       sample{};     /* 物理基址 */
-    uint16_t head{};       /* 最旧未消费样本的物理下标 */
-    uint16_t capacity{};   /* 物理缓冲元素数 */
-    uint8_t  count{};      /* 未消费样本数 */
+    T*       sample{};          /* 物理基址 */
+    uint16_t capacity{};        /* 物理缓冲元素数，必须是 2 的幂 */
+    volatile uint16_t head{};   /* 最旧未消费样本的物理下标 —— 只由消费者写 */
+    volatile uint16_t tail{};   /* 下一个可写槽的物理下标   —— 只由生产者写 */
 
-    /* 逻辑下标 i（0 = 最旧）→ 实际元素。i 必须 < count。 */
-    const T& at(const uint8_t i) const {
-        const uint32_t idx = static_cast<uint32_t>(head) + i;
-        return sample[idx >= capacity ? idx - capacity : idx];
+    /* 未消费样本数（消费者视角的一批快照；必须在本批处理前取一次）。 */
+    uint16_t available() const {
+        PYRO_STREAM_FENCE();
+        return static_cast<uint16_t>(
+            (static_cast<uint16_t>(tail) - static_cast<uint16_t>(head)) &
+            static_cast<uint16_t>(capacity - 1U));
     }
-    /* 最新样本（count 必须 > 0） */
+
+    /* 逻辑下标 i（0 = 最旧）→ 实际元素。i 必须 < available()。 */
+    const T& at(const uint16_t i) const {
+        return sample[(static_cast<uint16_t>(head) + i) &
+                      static_cast<uint16_t>(capacity - 1U)];
+    }
+    /* 最新样本（available() 必须 > 0） */
     const T& cur() const {
-        return at(static_cast<uint8_t>(count - 1U));
+        return at(static_cast<uint16_t>(available() - 1U));
     }
 
-    /* 内部状态推进：追加一个槽 / 归还 count 个。
-     * 满时覆盖最旧（head 前移一格），保证新样本总能写入——
-     * 与器件 FIFO continuous 模式"满后覆盖最旧"一致。 */
-    bool push(uint16_t& slot) {
-        if (capacity == 0U) {
-            return false;
+    /* ---- 生产者侧 ---- */
+    /* 取一个待写槽；返回 nullptr 表示已满（A1：丢弃新样本）。 */
+    T* reserve() {
+        if (capacity == 0U || sample == nullptr) {
+            return nullptr;
         }
-        if (count >= capacity) {
-            /* 满：丢弃最旧的一个，腾出位置（不改变 count） */
-            ++head;
-            if (head >= capacity) {
-                head = 0U;
-            }
-        } else {
-            ++count;
+        const uint16_t t = static_cast<uint16_t>(tail);
+        if (static_cast<uint16_t>((t + 1U) & static_cast<uint16_t>(capacity - 1U)) ==
+            static_cast<uint16_t>(head)) {
+            return nullptr; /* 满 */
         }
-        slot = static_cast<uint16_t>(head + count - 1U);
-        if (slot >= capacity) {
-            slot = static_cast<uint16_t>(slot - capacity);
-        }
-        return true;
+        return &sample[t];
     }
-    void advance(uint8_t n) {
-        if (n >= count) {
-            count = 0U;
-            head  = 0U;
-            return;
-        }
-        head = static_cast<uint16_t>(head + n);
-        if (head >= capacity) {
-            head = static_cast<uint16_t>(head - capacity);
-        }
-        count = static_cast<uint8_t>(count - n);
+    /* 槽内容写完后调用，才让消费者可见。 */
+    void publish() {
+        PYRO_STREAM_FENCE();
+        tail = static_cast<uint16_t>(
+            (static_cast<uint16_t>(tail) + 1U) & static_cast<uint16_t>(capacity - 1U));
+    }
+
+    /* ---- 消费者侧 ---- */
+    /* 归还 n 个已消费样本（超出未消费数时按实际数量处理）。 */
+    void release(uint16_t n) {
+        const uint16_t avail = available();
+        const uint16_t drop  = (n >= avail) ? avail : n;
+        PYRO_STREAM_FENCE();
+        head = static_cast<uint16_t>(
+            (static_cast<uint16_t>(head) + drop) & static_cast<uint16_t>(capacity - 1U));
     }
 };
 
@@ -104,7 +139,7 @@ struct imu_data_t {
     /**
      * 两路样本流（陀螺 / 加速度）。
      * 取样本：acc.at(i)/acc.cur()、gyro.at(i)/gyro.cur()；
-     * 数量：acc.count / gyro.count（0 表示没有新数据）；
+     * 数量：acc.available() / gyro.available()（0 表示没有新数据）；
      * 消费后归还：assume_acc_point()/assume_gyro_point()。
      */
     sample_stream_t<acc_sample_t>  acc{};
@@ -128,11 +163,11 @@ class imu_base_drv {
     /* 归还已消费的样本数（非虚：环形状态统一在 sample_stream_t 里，
      * 与具体 IMU 型号无关，派生类不需要也无法改变这个语义）。
      * 只前移 head 指针，O(1)，不搬数据；超出未消费数量时按实际数量处理。 */
-    void assume_acc_point(uint8_t count) {
-        _data.acc.advance(count);
+    void assume_acc_point(uint16_t count) {
+        _data.acc.release(count);
     }
-    void assume_gyro_point(uint8_t count) {
-        _data.gyro.advance(count);
+    void assume_gyro_point(uint16_t count) {
+        _data.gyro.release(count);
     }
 
     bool calibrate();
@@ -147,10 +182,10 @@ class imu_base_drv {
      * 典型实现为两段式：先发起状态事务、经完成中断唤醒后判读，再发起数据事务、
      * 再次唤醒后收取并解包。等待期间让出 CPU，不做轮询。
      *
-     * @retval true  本拍解出了新样本（见 acc.count / gyro.count）
+     * @retval true  本拍解出了新样本（见 acc.available() / gyro.available()）
      * @retval false 本拍没有新数据，或超时 / 总线失败（区分方式见 diag()）
      *
-     * @note  无数据时不得改变 count；缓冲满时覆盖最旧的未消费样本。
+     * @note  无数据时不得改变已有样本；缓冲满时【丢弃新样本】并计入 err_data。
      */
     virtual bool read() = 0;
 

@@ -39,6 +39,8 @@ volatile uint32_t imu_service_algo_rounds    = 0U;
 volatile uint32_t imu_service_vqf_consumed   = 0U;
 volatile uint32_t imu_service_err_bus        = 0U;
 volatile uint32_t imu_service_err_data       = 0U;
+volatile uint32_t imu_service_err_ovr        = 0U;
+volatile uint32_t imu_service_err_backpressure = 0U;
 volatile uint32_t imu_service_err_timeout    = 0U;
 volatile uint32_t imu_service_vqf_err        = 0U;
 volatile uint32_t imu_service_vqf_warn       = 0U;
@@ -48,6 +50,10 @@ volatile uint32_t imu_service_vqf_us_avg     = 0U;
 volatile uint32_t imu_service_loop_us_avg    = 0U;
 volatile uint32_t imu_service_heap_free_min  = 0U;
 volatile uint32_t imu_service_ins_stack_free = 0U;
+volatile uint32_t imu_service_cap_stack_free = 0U;
+volatile uint32_t imu_service_cap_rounds     = 0U;
+volatile uint32_t imu_service_cap_us_max     = 0U;
+volatile uint32_t imu_service_cap_us_avg     = 0U;
 volatile float    imu_service_quat[4]        = {1.0f, 0.0f, 0.0f, 0.0f};
 volatile float    imu_service_quat_norm      = 1.0f;
 volatile float    imu_service_accel_mps2[3]  = {0.0f, 0.0f, 0.0f};
@@ -92,13 +98,21 @@ imu_publish_params_t s_publish_params{};
 float s_last_acc_dev[3]  = {0.0f, 0.0f, 0.0f};
 float s_last_gyro_dev[3] = {0.0f, 0.0f, 0.0f};
 
-/* 1 秒窗口统计（峰值/平均），只用于观测，不影响功能 */
+/* 1 秒窗口统计（采集 / 融合各一套，互不影响），只用于观测，不影响功能。
+ * 【必须各用各的窗口边界】：两个任务曾共用 s_next_1s，采集先到就把边界推进，
+ * 融合侧的窗口条件几乎永不成立，表现为 vqf_us_avg/ins_stack_free 恒为 0。 */
 uint32_t s_us_max    = 0U;
 uint32_t s_us_sum    = 0U;
 uint32_t s_win_round = 0U;
 uint32_t s_loop_sum  = 0U;
 uint32_t s_loop_cnt  = 0U;
-uint32_t s_next_1s   = 0U;
+uint32_t s_algo_next_1s = 0U;   /* 融合任务的 1 s 窗口边界 */
+
+/* 采集任务侧窗口 */
+uint32_t s_cap_us_max = 0U;
+uint32_t s_cap_us_sum = 0U;
+uint32_t s_cap_win    = 0U;
+uint32_t s_cap_next_1s = 0U;    /* 采集任务的 1 s 窗口边界 */
 
 /* ZYX 偏航角（rad）。欧拉角导出与航向归零共用，保证唯一真源。 */
 float quat_yaw_rad(const float q[4])
@@ -143,59 +157,55 @@ void apply_heading_zero(float q[4], float yaw0)
 } // namespace
 
 /* ======================= 常驻任务 =======================
- * 采集与融合同一个任务顺序执行（理由见 ins_service.h）。
- * 栈取自 Config：1024 词承载 read() 的两段 DMA 等待 + ESKF + 快照发布。 */
-class ins_task_t final : public pyro::task_base_t
+ * 采集与融合分成两个任务（2026-11-16，SPSC 落地之后）：
+ *   ins_cap  —— 只做 read()，1 ms 硬周期，优先级 HIGH；周期不受融合耗时影响
+ *   ins_algo —— 只做 update() + 快照发布，优先级 ABOVE_NORMAL，尽力而为
+ *
+ * 交接完全依赖 SPSC 环形缓冲：采集只写 tail（publish），算法只写 head（release），
+ * 因此【全程不需要任何临界区】。旧单任务版把两者串行，融合耗时计入 1 ms 预算；
+ * 旧双任务版（SPSC 之前）用临界区保护，反而屏蔽了 SPI/DMA 中断。
+ *
+ * 器件初始化与算法配置放在采集任务的 init() 里（task_base_t::start() 在调用者
+ * 上下文执行它），保证 imu_service_t::init() 返回时已拿到真实结果。 */
+class cap_task_t final : public pyro::task_base_t
 {
   public:
-    ins_task_t()
-        : task_base_t("ins", 0U, config::kInsTaskStackWords,
+    cap_task_t()
+        : task_base_t("ins_cap", 0U, config::kCapTaskStackWords,
                       pyro::task_base_t::priority_t::HIGH)
     {
     }
 
   protected:
-    /* 器件初始化 + 算法配置都在 init() 里同步完成：
-     * task_base_t::start() 在调用者上下文执行它，因此 init() 返回时调用方
-     * 就能拿到真实结果。要求调度器已启动（read() 内部等 DMA 完成信号量）。 */
-    pyro::status_t init() override
-    {
-        pyro::dwt_drv_t::init(config::kCpuMhz); /* 统计融合单批耗时 */
-
-        const bool ok = s_imu.init();
-        imu_service_init_result = ok ? 0 : 1;
-        if (!ok)
-        {
-            return pyro::PYRO_ERROR;
-        }
-
-        /* 装配归一化：正向换系四元数的逆（姿态右乘用） */
-        mount_quat_inverse(k_imu_direct, s_m_inv);
-
-        /* 反向封包参数：由同一张正向表导出逆表，Sa/Sg/b 直接取驱动的解包参数，
-         * 保证通信层的反向换算与驱动正向换算同源。 */
-        mount_inverse_indices(k_imu_direct, s_publish_params.inv_idx,
-                              s_publish_params.inv_neg);
-        s_publish_params.acc_mps2_per_lsb = s_imu.acc_mps2_per_lsb();
-        s_publish_params.gyro_rps_per_lsb = s_imu.gyro_rps_per_lsb();
-        const imu_cali_t &cali = s_imu.read_imu_data().cali;
-        s_publish_params.gyro_bias_dev[0] = cali.gx_offset;
-        s_publish_params.gyro_bias_dev[1] = cali.gy_offset;
-        s_publish_params.gyro_bias_dev[2] = cali.gz_offset;
-
-        const pyro::status_t cfg = s_vqf.configure(config::vqf_config());
-        imu_service_vqf_ready = (cfg == pyro::PYRO_OK) ? 1 : 0;
-        if (cfg != pyro::PYRO_OK)
-        {
-            return cfg;
-        }
-
-        s_next_1s = static_cast<uint32_t>(xTaskGetTickCount()) + 1000U;
-        return pyro::PYRO_OK;
-    }
-
+    pyro::status_t init() override;
     void run_loop() override
     {
+        /* 采集节拍是产品的硬约束：read() 内部的两段 DMA 等待会挂起任务，
+         * 因此本任务绝大多数时间处于阻塞态，融合再慢也不会挤占这个周期。 */
+        TickType_t wake = xTaskGetTickCount();
+        for (;;)
+        {
+            ins_service_t::instance()._capture_loop();
+            vTaskDelayUntil(&wake, config::kPublishPeriodMs);
+        }
+    }
+};
+
+class ins_task_t final : public pyro::task_base_t
+{
+  public:
+    ins_task_t()
+        : task_base_t("ins_algo", 0U, config::kInsTaskStackWords,
+                      pyro::task_base_t::priority_t::ABOVE_NORMAL)
+    {
+    }
+
+  protected:
+    pyro::status_t init() override { return pyro::PYRO_OK; }
+    void run_loop() override
+    {
+        /* 尽力而为：每拍尽量算一次。融合耗时超过 1 ms 时本任务会自然降频，
+         * 但采集周期不受影响——这正是拆任务的目的。 */
         TickType_t wake = xTaskGetTickCount();
         for (;;)
         {
@@ -205,7 +215,46 @@ class ins_task_t final : public pyro::task_base_t
     }
 };
 
-ins_task_t s_task;
+cap_task_t s_cap_task;
+ins_task_t s_algo_task;
+
+/* 采集任务初始化：器件、总线、算法配置、装配参数都收在这里。 */
+pyro::status_t cap_task_t::init()
+{
+    pyro::dwt_drv_t::init(config::kCpuMhz); /* 统计融合/采集单批耗时 */
+
+    const bool ok = s_imu.init();
+    imu_service_init_result = ok ? 0 : 1;
+    if (!ok)
+    {
+        return pyro::PYRO_ERROR;
+    }
+
+    /* 装配归一化：正向换系四元数的逆（姿态右乘用） */
+    mount_quat_inverse(k_imu_direct, s_m_inv);
+
+    /* 反向封包参数：由同一张正向表导出逆表，Sa/Sg/b 直接取驱动的解包参数，
+     * 保证通信层的反向换算与驱动正向换算同源。 */
+    mount_inverse_indices(k_imu_direct, s_publish_params.inv_idx,
+                          s_publish_params.inv_neg);
+    s_publish_params.acc_mps2_per_lsb = s_imu.acc_mps2_per_lsb();
+    s_publish_params.gyro_rps_per_lsb = s_imu.gyro_rps_per_lsb();
+    const imu_cali_t &cali = s_imu.read_imu_data().cali;
+    s_publish_params.gyro_bias_dev[0] = cali.gx_offset;
+    s_publish_params.gyro_bias_dev[1] = cali.gy_offset;
+    s_publish_params.gyro_bias_dev[2] = cali.gz_offset;
+
+    const pyro::status_t cfg = s_vqf.configure(config::vqf_config());
+    imu_service_vqf_ready = (cfg == pyro::PYRO_OK) ? 1 : 0;
+    if (cfg != pyro::PYRO_OK)
+    {
+        return cfg;
+    }
+
+    s_cap_next_1s = static_cast<uint32_t>(xTaskGetTickCount()) + 1000U;
+    s_algo_next_1s = s_cap_next_1s;
+    return pyro::PYRO_OK;
+}
 
 /* ======================= 服务接口 ======================= */
 
@@ -221,10 +270,16 @@ pyro::status_t ins_service_t::init()
     {
         return pyro::PYRO_ALREADY_INIT;
     }
-    const pyro::status_t ret = s_task.start();
-    if (ret != pyro::PYRO_OK)
+    /* 顺序：先采集（完成器件初始化与算法配置），再算法（只消费缓冲）。 */
+    const pyro::status_t cap = s_cap_task.start();
+    if (cap != pyro::PYRO_OK)
     {
-        return ret;
+        return cap;
+    }
+    const pyro::status_t algo = s_algo_task.start();
+    if (algo != pyro::PYRO_OK)
+    {
+        return algo;
     }
     _started = true;
     imu_service_heap_free_min = static_cast<uint32_t>(xPortGetFreeHeapSize());
@@ -276,33 +331,77 @@ void ins_service_t::_update_heading_zero(float yaw_install, bool initialized,
     }
 }
 
-void ins_service_t::_round()
+/* ======================= 采集任务体 =======================
+ * 只做 read()：FIFO 状态 → 等 DMA → 读数据 → TAG 解包 → publish 到 SPSC 环形缓冲。
+ * 不碰算法状态、不发布快照，因此本函数耗时与融合复杂度无关。
+ * s_last_*_dev 是"最新一帧解包物理量"，由本任务写、算法任务读；
+ * 它是 3 个 float 的独立快照量，允许陈旧一拍（协议取"最新驱动物理量"语义）。 */
+void ins_service_t::_capture_loop()
 {
-    const uint32_t t_loop0 = pyro::dwt_drv_t::get_current_ticks();
-
+    const uint32_t t0 = pyro::dwt_drv_t::get_current_ticks();
     if (s_imu.read())
     {
         ++imu_service_read_ok;
 
         imu_data_t &data = s_imu.read_imu_data();
-        if (data.gyro.count != 0U)
+        if (data.gyro.available() != 0U)
         {
             const gyro_sample_t &g = data.gyro.cur();
             s_last_gyro_dev[0] = g.Gyro[0];
             s_last_gyro_dev[1] = g.Gyro[1];
             s_last_gyro_dev[2] = g.Gyro[2];
         }
-        if (data.acc.count != 0U)
+        if (data.acc.available() != 0U)
         {
             const acc_sample_t &a = data.acc.cur();
             s_last_acc_dev[0] = a.Accel[0];
             s_last_acc_dev[1] = a.Accel[1];
             s_last_acc_dev[2] = a.Accel[2];
         }
+    }
 
-        /* ---- 融合：单任务下环形缓冲在本段执行期间不会被写入，
-         *      head 稳定，at(i) 读到的一定是连续样本。 ---- */
-        const uint32_t t0  = pyro::dwt_drv_t::get_current_ticks();
+    /* 驱动侧诊断直通（累计计数）：read() 失败时也要刷新，否则看不出坏在哪一步。
+     * 数据源是驱动自己的计数器，本层不重复统计——镜像只是给调试器一个稳定入口。 */
+    const lsm6dsv16x_drv_t::diag_t diag = s_imu.diag();
+    imu_service_err_bus     = diag.err_bus;
+    imu_service_err_data    = diag.err_data;
+    imu_service_err_timeout = diag.err_timeout;
+    imu_service_err_ovr     = diag.err_ovr;
+    imu_service_err_backpressure = diag.err_backpressure;
+
+    /* 采集侧耗时统计（含两段 DMA 等待，是"采集是否守住 1 ms"的直接口径）。 */
+    const uint32_t us =
+        static_cast<uint32_t>((pyro::dwt_drv_t::get_current_ticks() - t0) /
+                              config::kCpuMhz);
+    if (us > s_cap_us_max) { s_cap_us_max = us; }
+    s_cap_us_sum += us;
+    ++s_cap_win;                 /* 先计数，重置时才不会把本次漏掉 */
+    ++imu_service_cap_rounds;
+
+    /* 1 秒窗口：采集/融合各刷各的，互不影响。 */
+    const uint32_t now = static_cast<uint32_t>(xTaskGetTickCount());
+    if (static_cast<int32_t>(now - s_cap_next_1s) >= 0)
+    {
+        s_cap_next_1s += 1000U;
+        imu_service_cap_us_max = s_cap_us_max;
+        imu_service_cap_us_avg = (s_cap_win > 0U) ? (s_cap_us_sum / s_cap_win) : 0U;
+        imu_service_cap_stack_free = uxTaskGetStackHighWaterMark(nullptr);
+        s_cap_us_max = 0U;
+        s_cap_us_sum = 0U;
+        s_cap_win    = 0U;
+    }
+}
+
+void ins_service_t::_round()
+{
+    const uint32_t t_loop0 = pyro::dwt_drv_t::get_current_ticks();
+
+    /* ---- 融合：本任务【只消费】环形缓冲。
+     *      SPSC 保证生产者（采集任务）只移动 tail、本任务只移动 head，
+     *      因此 at(i) 读到的一定是完整样本，且无需任何临界区。 ---- */
+    {
+        imu_data_t &data = s_imu.read_imu_data();
+        const uint32_t t0 = pyro::dwt_drv_t::get_current_ticks();
         const pyro::status_t st = s_vqf.update(data);
         const uint32_t us =
             static_cast<uint32_t>((pyro::dwt_drv_t::get_current_ticks() - t0) /
@@ -413,24 +512,17 @@ void ins_service_t::_round()
         imu_service_acc_rejected    = state.acc_rejected ? 1U : 0U;
     }
 
-    /* 驱动侧诊断直通（累计计数）：read() 失败时也要刷新，否则看不出坏在哪一步。
-     * 数据源是驱动自己的计数器，本层不重复统计——镜像只是给调试器一个稳定入口。 */
-    const lsm6dsv16x_drv_t::diag_t diag = s_imu.diag();
-    imu_service_err_bus     = diag.err_bus;
-    imu_service_err_data    = diag.err_data;
-    imu_service_err_timeout = diag.err_timeout;
-
-    /* ---- 1 秒窗口统计：单批融合与整拍的峰值/平均 ---- */
+    /* ---- 1 秒窗口统计：本任务的融合单批与整拍耗时（采集侧另有一套） ---- */
     s_loop_sum += static_cast<uint32_t>(
         (pyro::dwt_drv_t::get_current_ticks() - t_loop0) / config::kCpuMhz);
     ++s_loop_cnt;
-    if (static_cast<int32_t>(static_cast<uint32_t>(xTaskGetTickCount()) - s_next_1s) >= 0)
+    if (static_cast<int32_t>(static_cast<uint32_t>(xTaskGetTickCount()) - s_algo_next_1s) >= 0)
     {
-        s_next_1s += 1000U;
+        s_algo_next_1s += 1000U;
         imu_service_vqf_us_max  = s_us_max;
         imu_service_vqf_us_avg  = (s_win_round > 0U) ? (s_us_sum / s_win_round) : 0U;
         imu_service_loop_us_avg = (s_loop_cnt > 0U) ? (s_loop_sum / s_loop_cnt) : 0U;
-        /* 栈余量（词）：随窗口一起刷新，用于确认 1024 词是否够用 */
+        /* 栈余量（词）：随窗口一起刷新，用于确认 768 词是否够用 */
         imu_service_ins_stack_free = uxTaskGetStackHighWaterMark(nullptr);
         s_us_max    = 0U;
         s_us_sum    = 0U;

@@ -24,9 +24,9 @@ extern "C" arm_status __real_arm_mat_mult_f32(const arm_matrix_instance_f32 *,
 extern "C" arm_status __wrap_arm_mat_mult_f32(const arm_matrix_instance_f32 *a,
     const arm_matrix_instance_f32 *b, arm_matrix_instance_f32 *out)
 {
-    /* 注入目标：误差注入的块运算 G·P·Gᵀ 里第一次 3×3 乘法（a = J_l，小角度下近单位阵）。
-     * 改用块结构后，"G·P" 这个 6×6 乘法已不存在，故判别式从 6×6 改为 3×3。
-     * 加速度-only 路径上不会触发 _update_gyr，因此这里的 3×3 乘法只来自 _inject_error。 */
+    /* 濞夈劌鍙嗛惄顔界垼閿涙俺顕ゅ顔芥暈閸忋儳娈戦崸妤勭箥缁?G璺疨璺疓宀偓 闁插瞼顑囨稉鈧▎?3鑴? 娑旀ɑ纭堕敍鍧?= J_l閿涘苯鐨憴鎺戝娑撳绻庨崡鏇氱秴闂冪绱氶妴?
+     * 閺€鍦暏閸ф绮ㄩ弸鍕倵閿?G璺疨" 鏉╂瑤閲?6鑴? 娑旀ɑ纭跺韫瑝鐎涙ê婀敍灞炬櫊閸掋倕鍩嗗蹇庣矤 6鑴? 閺€閫涜礋 3鑴?閵?
+     * 閸旂娀鈧喎瀹?only 鐠侯垰绶炴稉濠佺瑝娴兼俺袝閸?_update_gyr閿涘苯娲滃銈堢箹闁插瞼娈?3鑴? 娑旀ɑ纭堕崣顏呮降閼?_inject_error閵?*/
     bool injection = fail_injection && a->numRows == 3 && a->numCols == 3 && b->numCols == 3 &&
         a->pData[0] > 0.999f && a->pData[4] > 0.999f && a->pData[8] > 0.999f;
     if (fail_product || injection)
@@ -98,8 +98,9 @@ pyro::status_t feed(vqf_t &filter, uint32_t timestamp, const Vec &gyro, const Ve
     acc_sample_t a{timestamp, {float(acc[0]), float(acc[1]), float(acc[2])}};
     imu_data_t data;
     data.timestamp_tick_s = 1.0e-6f;
-    data.gyro = {&g, 0, 1, 1};
-    data.acc = {&a, 0, 1, 1};
+    /* SPSC閿涙瓭apacity 韫囧懘銆忔稉?2 閻ㄥ嫬绠撻敍娑樺礋濡茶姤妞?tail 閸撳秶些閸楀疇銆冪粈?1 娑擃亜绶熷☉鍫ｅ瀭閺嶉攱婀伴妴?*/
+    data.gyro = {&g, 2U, 0U, 1U};
+    data.acc  = {&a, 2U, 0U, 1U};
     const auto result = filter.update(data);
     require(result == pyro::PYRO_OK || result == pyro::PYRO_WARNING, "valid sample update");
     const auto state = filter.get_state();
@@ -309,14 +310,16 @@ void timestamps_and_batching()
     vqf_t single, batch;
     require(single.configure(config()) == pyro::PYRO_OK && batch.configure(config()) == pyro::PYRO_OK,
             "configure batching");
-    std::array<gyro_sample_t, 24> gs{};
-    std::array<acc_sample_t, 24> as{};
+    /* SPSC 鐟曚焦鐪?capacity 娑?2 閻ㄥ嫬绠撻敍鍫熷负閻椒鍞弴鍨絿濡槄绱氶妴鍌滄暏 16 濡插鈧弓ead=12 閸掑爼鈧姴娲栫紒鏇窗
+     * 闁槒绶?0..9 鐎电懓绨查悧鈺冩倞 12,13,14,15,0,1,2,3,4,5閵?*/
+    std::array<gyro_sample_t, 16> gs{};
+    std::array<acc_sample_t, 16> as{};
     uint32_t timestamp = UINT32_MAX - 200000;
     for (int base = 0; base < 4000; base += 10)
     {
         for (int i = 0; i < 10; ++i)
         {
-            const int slot = (21+i)%24;
+            const int slot = (12+i)%16;
             timestamp += uint32_t(900+(base+i)%3*100);
             gs[slot] = {timestamp, {0, 0, 1.0f}};
             as[slot] = {timestamp, {0, 0, float(gravity)}};
@@ -324,8 +327,8 @@ void timestamps_and_batching()
         }
         imu_data_t data;
         data.timestamp_tick_s = 1e-6f;
-        data.gyro = {gs.data(), 21, 24, 10};
-        data.acc = {as.data(), 21, 24, 10};
+        data.gyro = {gs.data(), 16U, 12U, 22U};  /* available = (22-12)&15 = 10 */
+        data.acc  = {as.data(), 16U, 12U, 22U};
         const auto status = batch.update(data);
         require(status == pyro::PYRO_OK || status == pyro::PYRO_WARNING, "batch status");
         require(batch.get_state().consumed_acc == 10 && batch.get_state().consumed_gyr == 10,
@@ -343,8 +346,8 @@ void timestamps_and_batching()
         acc_sample_t acc{uint32_t(i*500), {0, 0, float(gravity)}};
         imu_data_t data;
         data.timestamp_tick_s = 1e-6f;
-        data.gyro = {&gyro, 0, 1, 1};
-        if (i%4 == 0) data.acc = {&acc, 0, 1, 1};
+        data.gyro = {&gyro, 2U, 0U, 1U};
+        if (i%4 == 0) data.acc = {&acc, 2U, 0U, 1U};
         const auto status = asynchronous.update(data);
         require(status == pyro::PYRO_OK || status == pyro::PYRO_WARNING, "unequal-rate update");
     }
@@ -375,8 +378,8 @@ void sensor_tick_rates()
                             {float(acceleration[0]), float(acceleration[1]), float(acceleration[2])}};
             imu_data_t data;
             data.timestamp_tick_s = tick_s;
-            data.gyro = {&gyro, 0, 1, 1};
-            data.acc = {&acc, 0, 1, 1};
+            data.gyro = {&gyro, 2U, 0U, 1U};
+            data.acc = {&acc, 2U, 0U, 1U};
             const auto status = filter.update(data);
             require(status == pyro::PYRO_OK || status == pyro::PYRO_WARNING, "hardware clock sample");
             before = truth;
@@ -420,8 +423,8 @@ void invalid_inputs_and_reconfiguration()
     gyro_sample_t gyro{2000000, {0, 0, 0}};
     acc_sample_t acc{2000000, {0, 0, float(gravity)}};
     data.timestamp_tick_s = 1e-6f;
-    data.gyro = {&gyro, 0, 1, 1};
-    data.acc = {&acc, 0, 1, 1};
+    data.gyro = {&gyro, 2U, 0U, 1U};
+    data.acc = {&acc, 2U, 0U, 1U};
     require(filter.update(data) == pyro::PYRO_WARNING && filter.get_state().quat == before.quat,
             "duplicate timestamps skip integration");
     gyro.timestamp--;
@@ -458,7 +461,7 @@ void numerical_failure_recovery()
     gyro_sample_t gyro{1501000, {0.1f, 0, 0}};
     imu_data_t data;
     data.timestamp_tick_s = 1e-6f;
-    data.gyro = {&gyro, 0, 1, 1};
+    data.gyro = {&gyro, 2U, 0U, 1U};
     fail_product = true;
     require(filter.update(data) != pyro::PYRO_OK && filter.get_state().consumed_gyr == 0,
             "failed gyro prediction leaves sample for retry");
@@ -467,8 +470,9 @@ void numerical_failure_recovery()
             "retry gyro prediction");
     before = filter.get_state();
     acc_sample_t acc{1520000, {0.1f, 0, float(gravity)}};
-    data.gyro.count = 0;
-    data.acc = {&acc, 0, 1, 1};
+    data.gyro.tail = 0U;   /* 闄€铻烘祦娓呯┖锛歵ail == head 鍗?0 涓緟娑堣垂鏍锋湰 */
+    data.gyro.head = 0U;
+    data.acc = {&acc, 2U, 0U, 1U};
     fail_injection = true;
     require(filter.update(data) != pyro::PYRO_OK && !fail_injection, "injection failure reached");
     require(filter.get_state().consumed_acc == 1 && filter.get_state().quat == before.quat,

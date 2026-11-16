@@ -111,14 +111,28 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void const * argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
-  /* IMU 采集链路启动：调度器已运行，满足信号量 / HAL_Delay / DMA 等待前提。
-   * 本调用内部完成器件初始化并拉起【单个】采集+融合常驻任务（早期版本的
-   * capture / algo 双任务已合并，原因见 Module/IMU/imu_service.cpp 文件头）。
-   * 失败原因见 imu_module_init_result 与 imu_service_* 诊断量。
-   * 注：本任务完成初始化后只是空转保活；其 4 KB 栈长期占用 FreeRTOS 堆，
-   * 若确认不需要它承担后续复位/看护职责，可在此改为 vTaskDelete(NULL)。 */
+  /* IMU 链路启动：调度器已运行，满足信号量 / HAL_Delay / DMA 等待前提。
+   * 本调用内部完成器件初始化，并拉起【采集】与【融合+发布】两个常驻任务
+   * （拆分原因见 Module/IMU/ins_service.cpp 文件头）。
+   * 失败原因见 imu_module_init_result 与 imu_service_* 诊断量。 */
   (void)imu_module_init();
-  /* Infinite loop */
+
+  /* 回收引导任务：初始化完成后本任务无事可做，自删归还 1024 词（4 KB）栈与 TCB。
+   *
+   * 为什么需要这一步（实测数据）：12 KB 堆里原本放
+   *   defaultTask 4K + ins 4K + pub 1.5K + IDLE 0.5K + TCB ≈ 10 KB，余 3176 B。
+   * 拆出采集任务后多出 ins_cap，若不回收引导任务则峰值超过 12288 B，
+   * imu_pub 创建失败 -> imu_module_init_result = -4（已实测到该值）。
+   *
+   * 注意：vTaskDelete(NULL) 只是把本任务标记为待删，真正的栈回收发生在
+   * idle 任务执行 prvCheckTasksWaitingTermination 时，因此【不能】指望
+   * "删完立刻用回这 4 KB 去创建别的任务"。所以创建期的堆峰值必须靠
+   * 另一条路压下来 —— 见 Module/Config/imu_config.h 里 ins_cap 的栈取值。
+   * 这里自删的意义是：稳态运行期把 4 KB 还给系统（实测 heap_free 由
+   * 创建期的紧张值回到约 4.7 KB）。 */
+  vTaskDelete(NULL);
+
+  /* 以下不可达，保留以明确语义 */
   for(;;)
   {
     osDelay(1);

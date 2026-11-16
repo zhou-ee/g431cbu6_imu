@@ -8,7 +8,7 @@ imu_base_drv::~imu_base_drv() = default;
 /**
  * @brief 陀螺零偏 + 重力模长标定
  * @note  依赖派生类 read() 的语义："取回一批样本，陀螺写入 gyro_sample、
- *        加速度写入 acc 流，两者未被消费的数量体现在 acc.count / gyro.count"。
+ *        加速度写入 acc 流，两者未被消费的数量体现在 acc.available() / gyro.available()"。
  *        本函数不关心 read() 的返回值，只按两路计数判断本批有没有新数据。
  *        标定期间器件需保持静止。两路独立计数，各自攒够 target 个样本为止
  *        （陀螺/加速度同速率时同步完成；1920 Hz 下 500 个约 260 ms）。
@@ -25,8 +25,8 @@ bool imu_base_drv::calibrate() {
     _data.cali.gx_offset = 0.0f;
     _data.cali.gy_offset = 0.0f;
     _data.cali.gz_offset = 0.0f;
-    assume_gyro_point(_data.gyro.count);
-    assume_acc_point(_data.acc.count);
+    assume_gyro_point(_data.gyro.available());
+    assume_acc_point(_data.acc.available());
 
     double   sum_gyro[3] = {0.0, 0.0, 0.0};
     double   sum_norm    = 0.0;
@@ -50,18 +50,18 @@ bool imu_base_drv::calibrate() {
     while (got_gyro < static_cast<uint32_t>(target) || got_acc < static_cast<uint32_t>(target)) {
         const uint32_t previous_gyro_count = got_gyro;
         const uint32_t previous_acc_count  = got_acc;
-        (void)read(); /* 标定不关心返回值，只看两路 count */
+        (void)read(); /* 标定不关心返回值，只看两路可用样本数 */
 
-        const uint8_t ng = _data.gyro.count;
-        const uint8_t na = _data.acc.count;
-        for (uint8_t i = 0U; i < ng && got_gyro < static_cast<uint32_t>(target); ++i) {
+        const uint16_t ng = _data.gyro.available();
+        const uint16_t na = _data.acc.available();
+        for (uint16_t i = 0U; i < ng && got_gyro < static_cast<uint32_t>(target); ++i) {
             const gyro_sample_t &s = _data.gyro.at(i); /* 逻辑下标，内部处理回绕 */
             sum_gyro[0] += static_cast<double>(s.Gyro[0]);
             sum_gyro[1] += static_cast<double>(s.Gyro[1]);
             sum_gyro[2] += static_cast<double>(s.Gyro[2]);
             ++got_gyro;
         }
-        for (uint8_t i = 0U; i < na && got_acc < static_cast<uint32_t>(target); ++i) {
+        for (uint16_t i = 0U; i < na && got_acc < static_cast<uint32_t>(target); ++i) {
             const acc_sample_t &s = _data.acc.at(i);
             const double ax = s.Accel[0];
             const double ay = s.Accel[1];

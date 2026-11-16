@@ -80,8 +80,12 @@ vector_t<3> inclination_error(const vector_t<3> &direction)
 
 template <typename Sample> bool valid_stream(const sample_stream_t<Sample> &stream)
 {
-    return stream.count == 0 ||
-        (stream.sample && stream.count <= stream.capacity && stream.head < stream.capacity);
+    /* SPSC 下行：索引只保证在 [0, capacity)，不变量由流自己维护。
+     * capacity 必须是 >= 2 的 2 的幂：掩码用 capacity-1，且需留一个哨兵槽
+     * 判别满，所以 capacity==1 会让掩码恒为 0、available() 永远读不到样本。 */
+    return stream.available() == 0 ||
+        (stream.sample != nullptr && stream.capacity >= 2U &&
+         (stream.capacity & (stream.capacity - 1U)) == 0U);
 }
 } // namespace
 
@@ -211,7 +215,12 @@ status_t vqf_t::update(const imu_data_t &data)
         err_stage = 1;
         return PYRO_PARAM_ERROR;
     }
-    if (data.gyro.count == 0 && data.acc.count == 0)
+    /* SPSC：本批要处理的样本数在批首取一次快照。
+     * 不在循环里重读 available()——那样批次边界会随生产者推进而变长，
+     * 也让 consumed_* 的语义（= 本批归还量）与"处理到哪"脱节。 */
+    const uint16_t gyr_batch = data.gyro.available();
+    const uint16_t acc_batch = data.acc.available();
+    if (gyr_batch == 0U && acc_batch == 0U)
         return PYRO_OK;
     if (!std::isfinite(data.timestamp_tick_s) || data.timestamp_tick_s <= 0.0f)
     {
@@ -227,12 +236,12 @@ status_t vqf_t::update(const imu_data_t &data)
     uint8_t &gyr_index = _state.consumed_gyr;
     uint8_t &acc_index = _state.consumed_acc;
     status_t batch_result = PYRO_OK;
-    while (gyr_index < data.gyro.count || acc_index < data.acc.count)
+    while (gyr_index < gyr_batch || acc_index < acc_batch)
     {
         // 先检查有效帧，再短路比较时间戳；差值为零时优先陀螺仪。
         // Check bounds before timestamp reads; zero delta selects the gyro.
-        const bool gyro_first = gyr_index < data.gyro.count &&
-            (acc_index >= data.acc.count ||
+        const bool gyro_first = gyr_index < gyr_batch &&
+            (acc_index >= acc_batch ||
              uint32_t(data.acc.at(acc_index).timestamp -
                       data.gyro.at(gyr_index).timestamp) < (uint32_t{1} << 31));
         const uint32_t timestamp = gyro_first

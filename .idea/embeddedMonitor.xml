@@ -1,25 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="EmbeddedMonitor">
-    <option name="watchItems">
-      <list>
-        <PersistedWatchItem>
-          <option name="expr" value="s_imu" />
-        </PersistedWatchItem>
-        <PersistedWatchItem>
-          <option name="expr" value="s_vqf" />
-        </PersistedWatchItem>
-        <PersistedWatchItem>
-          <option name="expr" value="imu_service_yaw" />
-        </PersistedWatchItem>
-        <PersistedWatchItem>
-          <option name="expr" value="imu_service_pitch" />
-        </PersistedWatchItem>
-        <PersistedWatchItem>
-          <option name="expr" value="imu_service_roll" />
-        </PersistedWatchItem>
-      </list>
-    </option>
     <option name="watchRefreshFreq" value="15" />
   </component>
 </project>

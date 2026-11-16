@@ -208,25 +208,32 @@ bool lsm6dsv16x_drv_t::read_direct() {
     }
 
     /* 两路各自组装 1 个样本（直读路径独立实现，不借道 FIFO 字格式）*/
-    /* 追加到样本流：满时自动覆盖最旧的未消费样本，指针总是有效 */
-    gyro_sample_t *gp = gyro_alloc();
-    acc_sample_t  *ap = acc_alloc();
+    /* SPSC 生产侧：先 reserve 拿槽（满则返回 nullptr，计 err_data），
+     * 原地写满内容，最后 commit 发布 tail —— 消费者不会看到半写样本。 */
+    gyro_sample_t *gp = gyro_reserve();
+    acc_sample_t  *ap = acc_reserve();
 
     /* 陀螺：dps → rad/s，逐轴减零偏。raw[1..3] 对应字节偏移 2/4/6 */
-    gyro_sample_t &g = *gp;
-    g.timestamp = _fifo.pend_ts;
-    const float gyro_lsb = _gyro_dps_per_lsb; /* 数据手册指定的 dps/LSB */
-    g.Gyro[0] = (static_cast<float>(load_i16le(&_fifo_raw[2])) * gyro_lsb * DEG_TO_RAD) - _data.cali.gx_offset;
-    g.Gyro[1] = (static_cast<float>(load_i16le(&_fifo_raw[4])) * gyro_lsb * DEG_TO_RAD) - _data.cali.gy_offset;
-    g.Gyro[2] = (static_cast<float>(load_i16le(&_fifo_raw[6])) * gyro_lsb * DEG_TO_RAD) - _data.cali.gz_offset;
+    if (gp != nullptr) {
+        gyro_sample_t &g = *gp;
+        g.timestamp = _fifo.pend_ts;
+        const float gyro_lsb = _gyro_dps_per_lsb; /* 数据手册指定的 dps/LSB */
+        g.Gyro[0] = (static_cast<float>(load_i16le(&_fifo_raw[2])) * gyro_lsb * DEG_TO_RAD) - _data.cali.gx_offset;
+        g.Gyro[1] = (static_cast<float>(load_i16le(&_fifo_raw[4])) * gyro_lsb * DEG_TO_RAD) - _data.cali.gy_offset;
+        g.Gyro[2] = (static_cast<float>(load_i16le(&_fifo_raw[6])) * gyro_lsb * DEG_TO_RAD) - _data.cali.gz_offset;
+        gyro_commit();
+    }
 
     /* 加速度：g → m/s²。raw[4..6] 对应字节偏移 8/10/12 */
-    acc_sample_t &a = *ap;
-    a.timestamp = _fifo.pend_ts;
-    const float acc_lsb = (_acc_fs_g * GRAVITY) / 32768.0f; /* m/s²/LSB */
-    a.Accel[0] = static_cast<float>(load_i16le(&_fifo_raw[8])) * acc_lsb;
-    a.Accel[1] = static_cast<float>(load_i16le(&_fifo_raw[10])) * acc_lsb;
-    a.Accel[2] = static_cast<float>(load_i16le(&_fifo_raw[12])) * acc_lsb;
+    if (ap != nullptr) {
+        acc_sample_t &a = *ap;
+        a.timestamp = _fifo.pend_ts;
+        const float acc_lsb = (_acc_fs_g * GRAVITY) / 32768.0f; /* m/s²/LSB */
+        a.Accel[0] = static_cast<float>(load_i16le(&_fifo_raw[8])) * acc_lsb;
+        a.Accel[1] = static_cast<float>(load_i16le(&_fifo_raw[10])) * acc_lsb;
+        a.Accel[2] = static_cast<float>(load_i16le(&_fifo_raw[12])) * acc_lsb;
+        acc_commit();
+    }
     return true;
 }
 
@@ -278,6 +285,7 @@ bool lsm6dsv16x_drv_t::read_fifo_batch() {
         (st[1] & (FIFO_STATUS2_FIFO_OVR_IA | FIFO_STATUS2_FIFO_OVR_LATCHED)) != 0U;
     if (ovr_now && !_fifo.ovr_prev) {
         ++_fifo.err_data; /* continuous 模式满后覆盖最旧：已丢样本 */
+        ++_fifo.err_ovr;  /* 器件侧溢出，与软件背压分开计数 */
     }
     _fifo.ovr_prev = ovr_now;
 
@@ -322,13 +330,18 @@ bool lsm6dsv16x_drv_t::read_fifo_batch() {
  *        TAG 位[7:3]：0x01 陀螺 / 0x02 加速度 / 0x03 温度 / 0x04 时间戳。
  * @note  pend_ts 跨调用保持：读边界切在槽中间时（如只读到陀螺字），
  *        下一轮读到同槽的加速度字仍用同一个时间戳，对齐不会错。
- * @note  追加一律走 acc_alloc()/gyro_alloc()：它们维护环形状态，
- *        满时覆盖最旧的未消费样本（与器件 FIFO continuous 语义一致）。
+ * @note  追加一律走 gyro_reserve()/acc_reserve() + commit：SPSC 生产侧，
+ *        先写满 payload 再 publish()，消费者不会看到半写样本；
+ *        满时丢弃新样本并计入 err_data（不覆盖最旧，见 sample_stream_t 头注释）。
  */
 void lsm6dsv16x_drv_t::fifo_parse_word(const uint8_t *word) {
     switch (word[0] & FIFO_DATA_OUT_TAG_TAG_SENSOR_MSK) {
         case FIFO_DATA_OUT_TAG_GYRO: {
-            gyro_sample_t &s = *gyro_alloc(); /* 满则覆盖最旧，总返回有效指针 */
+            gyro_sample_t *ps = gyro_reserve(); /* 满则 nullptr，已计 err_data */
+            if (ps == nullptr) {
+                break;
+            }
+            gyro_sample_t &s = *ps;
             s.timestamp = _fifo.pend_ts;
 
             const float gyro_lsb = _gyro_dps_per_lsb; /* 数据手册指定的 dps/LSB */
@@ -336,17 +349,23 @@ void lsm6dsv16x_drv_t::fifo_parse_word(const uint8_t *word) {
             s.Gyro[0] = (static_cast<float>(load_i16le(word + 1)) * gyro_lsb * DEG_TO_RAD) - _data.cali.gx_offset;
             s.Gyro[1] = (static_cast<float>(load_i16le(word + 3)) * gyro_lsb * DEG_TO_RAD) - _data.cali.gy_offset;
             s.Gyro[2] = (static_cast<float>(load_i16le(word + 5)) * gyro_lsb * DEG_TO_RAD) - _data.cali.gz_offset;
+            gyro_commit();
             break;
         }
 
         case FIFO_DATA_OUT_TAG_XL: {
-            acc_sample_t &s = *acc_alloc();
+            acc_sample_t *ps = acc_reserve();
+            if (ps == nullptr) {
+                break;
+            }
+            acc_sample_t &s = *ps;
             s.timestamp = _fifo.pend_ts;
 
             const float acc_lsb = (_acc_fs_g * GRAVITY) / 32768.0f; /* m/s²/LSB */
             s.Accel[0] = static_cast<float>(load_i16le(word + 1)) * acc_lsb;
             s.Accel[1] = static_cast<float>(load_i16le(word + 3)) * acc_lsb;
             s.Accel[2] = static_cast<float>(load_i16le(word + 5)) * acc_lsb;
+            acc_commit();
             break;
         }
 

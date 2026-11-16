@@ -67,8 +67,12 @@ class ins_service_t
 
     /* 任务类需要驱动文件内的硬件静态对象与 _round()。 */
     friend class ins_task_t;
+    friend class cap_task_t;
 
-    void _round();   /**< 一次采集 + 融合 + 发布，由任务每 1 ms 调用 */
+    /** 采集任务体：只做 read()（FIFO → SPSC 环形缓冲），1 ms 固定周期。 */
+    void _capture_loop();
+
+    void _round();   /**< 一次融合 + 发布，由算法任务每 1 ms 尽力调用 */
 
     /** 航向零点门控：三项条件同时成立才建立，另加超时兜底。
      *  @param yaw_install  本拍安装系 yaw，rad（只读，用于捕获零点）
@@ -107,7 +111,9 @@ extern volatile uint32_t imu_service_read_ok;          /* read() 返回 true 的
 extern volatile uint32_t imu_service_algo_rounds;      /* 实际执行融合的轮数 */
 extern volatile uint32_t imu_service_vqf_consumed;     /* 算法累计消费样本数（两路合计） */
 extern volatile uint32_t imu_service_err_bus;          /* 总线失败次数 */
-extern volatile uint32_t imu_service_err_data;         /* FIFO 溢出 / 未知 TAG / 缓冲覆盖 */
+extern volatile uint32_t imu_service_err_data;         /* FIFO 溢出 / 未知 TAG / 背压丢样 合计 */
+extern volatile uint32_t imu_service_err_ovr;          /* 其中：器件 FIFO 溢出（整拍未被读走） */
+extern volatile uint32_t imu_service_err_backpressure; /* 其中：环形缓冲满、丢弃新样本 */
 extern volatile uint32_t imu_service_err_timeout;      /* 等完成通知超时次数 */
 extern volatile uint32_t imu_service_vqf_err;          /* 算法返回 ERROR 的次数 */
 extern volatile uint32_t imu_service_vqf_warn;         /* 算法返回 WARNING 的次数 */
@@ -116,7 +122,11 @@ extern volatile uint32_t imu_service_vqf_us_max;       /* 单批融合耗时峰�
 extern volatile uint32_t imu_service_vqf_us_avg;       /* 单批融合平均耗时（µs，每秒刷新）*/
 extern volatile uint32_t imu_service_loop_us_avg;      /* 整拍平均耗时（读+融合+发布，µs）*/
 extern volatile uint32_t imu_service_heap_free_min;    /* 任务拉起后的 FreeRTOS 堆余量 */
-extern volatile uint32_t imu_service_ins_stack_free;    /* 采集/融合任务栈余量（词，1 s 刷新） */
+extern volatile uint32_t imu_service_ins_stack_free;    /* 融合任务栈余量（词，1 s 刷新） */
+extern volatile uint32_t imu_service_cap_stack_free;    /* 采集任务栈余量（词，1 s 刷新） */
+extern volatile uint32_t imu_service_cap_rounds;        /* 采集轮次（1 kHz 硬周期） */
+extern volatile uint32_t imu_service_cap_us_max;        /* 单拍 read() 峰值耗时（µs） */
+extern volatile uint32_t imu_service_cap_us_avg;        /* 单拍 read() 平均耗时（µs） */
 extern volatile float    imu_service_quat[4];          /* 安装系 [w,x,y,z] */
 extern volatile float    imu_service_quat_norm;        /* 应恒 ≈ 1.0 */
 extern volatile float    imu_service_accel_mps2[3];    /* 安装系加速度 */
