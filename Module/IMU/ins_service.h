@@ -72,6 +72,10 @@ class ins_service_t
     /** 采集任务体：只做 read()（FIFO → SPSC 环形缓冲），1 ms 固定周期。 */
     void _capture_loop();
 
+    /** 临时诊断黑匣子：记录 yaw 突变前后的关键量（见 imu_blackbox.h）。
+     *  只读观测，不改任何算法状态与输出。 */
+    void _blackbox_record(float yaw_deg, float bias_z_rps, bool rest, float rest_t);
+
     void _round();   /**< 一次融合 + 发布，由算法任务每 1 ms 尽力调用 */
 
     /** 航向零点门控：三项条件同时成立才建立，另加超时兜底。

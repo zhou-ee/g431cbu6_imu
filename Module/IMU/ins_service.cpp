@@ -19,6 +19,7 @@
 #include <cmath>
 
 #include "FreeRTOS.h"
+#include "imu_blackbox.h"
 #include "imu_config.h"
 #include "imu_mount.h"
 #include "lsm6dsv16x_drv.h"
@@ -392,6 +393,101 @@ void ins_service_t::_capture_loop()
     }
 }
 
+/* ======================= 临时诊断黑匣子 =======================
+ * 现象：剧烈运动后静止约 0.5 s，yaw 突变。需要把突变归因到具体哪一路修正。
+ *
+ * 位置说明：缓冲区放在【链接后的空闲 RAM】（_end 之后、主栈之前，约 9 KB），
+ * 用 section 属性显式落位，不占 BSS，因此不改变 .bss 大小、不影响 FreeRTOS 堆。
+ * 这是诊断代码，验证完应整体删除（连同 imu_blackbox.h）。
+ *
+ * 采样：每 5 拍（200 Hz）常规记一行；rest 跳变或 |dyaw| 超阈值时额外加记一行。
+ * 环形覆盖最旧，256 行 ≈ 1.28 s，足够覆盖"静止确认"那一段。 */
+extern "C" {
+__attribute__((section(".bbuf"), used, aligned(4)))
+volatile float imu_bb_rows[5120 / 4] = {};
+volatile uint32_t imu_bb_head      = 0U;
+volatile uint32_t imu_bb_total     = 0U;
+volatile uint32_t imu_bb_events    = 0U;
+volatile uint32_t imu_bb_div       = 0U;
+volatile float    imu_bb_max_dyaw  = 0.0f;
+volatile float    imu_bb_last_yaw  = 0.0f;
+volatile uint32_t imu_bb_rest_prev = 0U;
+/* 冻结标志：一旦 |dyaw| 超阈值即置 1，此后不再写入，
+ * 使缓冲区永久保留"突变前后"那 1.28 s，随时可回读。 */
+volatile uint32_t imu_bb_frozen    = 0U;
+/* 记录使能：复位时置 1；置 0 停止一切写入。 */
+volatile uint32_t imu_bb_enable    = 1U;
+}
+
+namespace
+{
+/* 供调试器清零记录（watch 后手工把 imu_bb_head/total 置 0 也可）。 */
+inline void bb_emit(float yaw_deg, float bias_z, float dyaw, float rest_t,
+                    bool rest, uint8_t flags)
+{
+    const uint32_t idx = imu_bb_head & (blackbox::kRows - 1U);
+    volatile float *row = &imu_bb_rows[(idx * 20U) / 4U];
+    /* 按 blackbox::row_t 的布局手写字段（缓冲是 float 数组，不能用结构体赋值） */
+    volatile uint16_t *as16 = reinterpret_cast<volatile uint16_t *>(
+        const_cast<float *>(row));
+    volatile uint8_t *as8 = reinterpret_cast<volatile uint8_t *>(
+        const_cast<float *>(row));
+    as16[0] = static_cast<uint16_t>(xTaskGetTickCount() & 0xFFFFU);     /* +0 tick */
+    as8[2]  = rest ? 1U : 0U;                                            /* +2 */
+    as8[3]  = flags;                                                     /* +3 (占 flags 低字节) */
+    row[1]  = yaw_deg;                                                   /* +4 */
+    row[2]  = bias_z;                                                    /* +8 */
+    row[3]  = dyaw;                                                      /* +12 */
+    row[4]  = rest_t;                                                    /* +16 */
+    imu_bb_head = idx + 1U;
+    ++imu_bb_total;
+}
+} // namespace
+
+void ins_service_t::_blackbox_record(float yaw_deg, float bias_z_rps, bool rest,
+                                     float rest_t)
+{
+    const float dyaw = yaw_deg - imu_bb_last_yaw;
+    imu_bb_last_yaw = yaw_deg;
+    const float abs_dyaw = (dyaw < 0.0f) ? -dyaw : dyaw;
+    if (abs_dyaw > imu_bb_max_dyaw) { imu_bb_max_dyaw = abs_dyaw; }
+
+    const bool rest_now = rest;
+    const bool rest_jump = (static_cast<uint32_t>(rest_now ? 1 : 0) != imu_bb_rest_prev);
+    imu_bb_rest_prev = rest_now ? 1U : 0U;
+
+    const bool big = abs_dyaw > blackbox::kDyawAlarm;
+
+    /* 冻结优先：一旦判为突变，立即停写，把"突变前后"这段永久留在缓冲里。
+     * 必须在写入之前判断当前值，否则会把突变行写进去再冻结也没关系，
+     * 关键是【冻结之后不再覆盖】，否则事后回读拿到的永远是新的稳态数据。 */
+    if (big && imu_bb_frozen == 0U)
+    {
+        ++imu_bb_events;
+        bb_emit(yaw_deg, bias_z_rps, dyaw, rest_t, rest_now, 0x02U);
+        imu_bb_frozen = 1U;
+        return;
+    }
+    if (imu_bb_frozen != 0U || imu_bb_enable == 0U)
+    {
+        return;
+    }
+
+    /* 事件加记：rest 跳变时不等采样节拍 */
+    if (rest_jump)
+    {
+        ++imu_bb_events;
+        bb_emit(yaw_deg, bias_z_rps, dyaw, rest_t, rest_now, 0x01U);
+    }
+
+    /* 常规降采样：每 5 拍一行 */
+    if (++imu_bb_div >= blackbox::kSampleDiv)
+    {
+        imu_bb_div = 0U;
+        bb_emit(yaw_deg, bias_z_rps, dyaw, rest_t, rest_now, 0x04U);
+    }
+}
+
 void ins_service_t::_round()
 {
     const uint32_t t_loop0 = pyro::dwt_drv_t::get_current_ticks();
@@ -454,6 +550,9 @@ void ins_service_t::_round()
 
         float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
         quat_to_euler(q, roll, pitch, yaw);
+
+        /* ---- 临时诊断黑匣子（见 imu_blackbox.h）：只读观测，不改算法行为 ---- */
+        _blackbox_record(yaw, bias_inst[2], state.rest_detected, state.rest_t);
 
         /* ---- 组快照（全量 POD，seqlock 发布） ---- */
         imu_snapshot_t next{};
