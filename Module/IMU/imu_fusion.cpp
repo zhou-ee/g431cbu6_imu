@@ -186,6 +186,16 @@ pyro::status_t init()
     }
 
     s_algo_next_1s = static_cast<uint32_t>(xTaskGetTickCount()) + 1000U;
+
+    /* 清一次错误计数：到这里消费侧已就绪，之后再出现的 backpressure / ovr
+     * 才是"稳态是否掉链子"的真实信号。
+     *
+     * 为什么需要这一步：上电时采集任务（HIGH）先于融合任务跑起来，
+     * 而 vqf 的首帧初始化（时间基准建立、倾斜对齐）明显重于稳态，
+     * 期间 64 帧的环形缓冲会被填满并丢弃一批样本。实测每次上电固定
+     * 产生约 88 次 err_backpressure，但此后 261 秒内零增长——
+     * 若不清零，这个固定偏置会让"持续堆积"的判据失效。 */
+    capture::clear_error_counters();
     return pyro::PYRO_OK;
 }
 

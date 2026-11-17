@@ -70,6 +70,17 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
                 _fifo.err_backpressure};
     }
 
+    /** 清零累计错误计数（不动 ovr_prev 边沿状态与 pend_ts）。
+     *  供产品层在"启动瞬态结束、消费侧就绪"时调用一次，
+     *  使 err_* 只反映稳态，便于用其判断持续堆积。 */
+    void clear_error_counters() {
+        _fifo.err_bus = 0U;
+        _fifo.err_data = 0U;
+        _fifo.err_timeout = 0U;
+        _fifo.err_ovr = 0U;
+        _fifo.err_backpressure = 0U;
+    }
+
     private:
     lsm6dsv16x_t& _device;
     float _acc_fs_g{4.0f};        /* g，init() 时按 imu_cfg_t 设定 */

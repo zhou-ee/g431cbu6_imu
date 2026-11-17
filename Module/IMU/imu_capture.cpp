@@ -178,5 +178,16 @@ uint32_t cap_us_max()      { return imu_service_cap_us_max; }
 uint32_t cap_us_avg()      { return imu_service_cap_us_avg; }
 uint32_t cap_stack_free()  { return imu_service_cap_stack_free; }
 
+void clear_error_counters()
+{
+    /* 清驱动内部计数器 + 同步镜像，避免下一拍 capture_once() 把旧值写回来。 */
+    s_imu.clear_error_counters();
+    imu_service_err_bus          = 0U;
+    imu_service_err_data         = 0U;
+    imu_service_err_timeout      = 0U;
+    imu_service_err_ovr          = 0U;
+    imu_service_err_backpressure = 0U;
+}
+
 } // namespace capture
 } // namespace imu_module
