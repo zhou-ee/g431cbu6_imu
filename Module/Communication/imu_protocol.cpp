@@ -13,6 +13,8 @@
 
 #include <cmath>
 
+#include "pyro_crc.h"   /* CRC 统一由 PYRo/Algorithm/CRC 提供 */
+
 namespace imu_module
 {
 namespace protocol
@@ -34,27 +36,6 @@ int32_t round_clamp(float value, int32_t low, int32_t high)
         return low;
     }
     return static_cast<int32_t>(std::lroundf(value)); /* 半分远离零 */
-}
-
-uint16_t crc16_ccitt_false(const uint8_t *data, std::size_t len)
-{
-    uint16_t crc = 0xFFFFU;
-    for (std::size_t i = 0U; i < len; ++i)
-    {
-        crc ^= static_cast<uint16_t>(static_cast<uint16_t>(data[i]) << 8U);
-        for (uint8_t bit = 0U; bit < 8U; ++bit)
-        {
-            if ((crc & 0x8000U) != 0U)
-            {
-                crc = static_cast<uint16_t>((crc << 1U) ^ 0x1021U);
-            }
-            else
-            {
-                crc = static_cast<uint16_t>(crc << 1U);
-            }
-        }
-    }
-    return crc;
 }
 
 uint32_t can_base_id(uint8_t node_id)
@@ -114,10 +95,10 @@ std::size_t encode_uart_frame(const payload_t &payload, uint8_t out[kUartFrameSi
         out[4U + 2U * i + 1U] = static_cast<uint8_t>((value >> 8U) & 0xFFU);
     }
     /* CRC 覆盖帧头与长度：接收端必须先按帧头对齐再对整段前缀校验，
-     * 长度也在校验范围内，长度被篡改时校验必然失败。 */
-    const uint16_t crc = crc16_ccitt_false(out, kUartFrameSize - 2U);
-    out[kUartFrameSize - 2U] = static_cast<uint8_t>(crc & 0xFFU);
-    out[kUartFrameSize - 1U] = static_cast<uint8_t>((crc >> 8U) & 0xFFU);
+     * 长度也在校验范围内，长度被篡改时校验必然失败。
+     * 算法与实现统一交给 PYRo/Algorithm/CRC（append_crc16_check_sum，
+     * 写入缓冲区末尾两字节、低字节在前），本层不再自带实现。 */
+    append_crc16_check_sum(out, static_cast<uint16_t>(kUartFrameSize));
     return kUartFrameSize;
 }
 

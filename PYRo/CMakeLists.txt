@@ -44,9 +44,11 @@ target_sources(PYRo PRIVATE
         # --- Algorithm ---
         # Matrix / VQF：CMSIS-DSP 后端与六轴姿态估计。
         # KF（pyro_algo_kf.h + .tpp）为纯头文件，只需包含路径。
+        # CRC：UART 帧使用其中的 crc16_ccitt_false（产品协议）。
         # 链接自检（可选）：tests/pyro_algo_link_check.cpp
         Algorithm/Matrix/pyro_algo_matrix.cpp
         Algorithm/VQF/pyro_algo_vqf.cpp
+        Algorithm/CRC/pyro_crc.cpp
 
         # --- IMU ---
         Component/IMU/imu_base_drv.cpp
@@ -74,6 +76,7 @@ target_include_directories(PYRo PUBLIC
         Algorithm/KF
         Algorithm/Butterworth
         Algorithm/VQF
+        Algorithm/CRC
 
         Component/IMU
         Component/IMU/lsm6dsv16x

@@ -17,7 +17,8 @@
 
 #include "imu_mount.h"
 #include "imu_protocol.h"
-#include "imu_snapshot.h"
+#include "imu_fusion.h"
+#include "pyro_crc.h"   /* CRC 实现由 PYRo 提供，测试直接校验其标准向量 */
 
 using imu_module::imu_publish_params_t;
 using imu_module::imu_snapshot_t;
@@ -108,7 +109,7 @@ void test_documented_vector()
         0xFF, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             /* qw qx qy qz */
         0x00, 0x00, 0x00, 0x00, 0x00, 0x20,                         /* acc x y z */
         0xE8, 0x03, 0x30, 0xF8, 0xB8, 0x0B,                         /* gyro x y z */
-        0x87, 0xBD                                                  /* CRC16 低字节在前 */
+        0xE4, 0x5A                                                  /* CRC16 低字节在前 */
     };
     for (std::size_t i = 0U; i < 26U; ++i)
     {
@@ -120,9 +121,11 @@ void test_documented_vector()
     }
     ++g_checks;
 
-    /* CRC 标准校验向量 */
+    /* CRC 标准校验向量：CRC 实现来自 PYRo/Algorithm/CRC（反射查表族，
+     * poly 0x1021 反射、init 0xFFFF、无 xorout）。
+     * "123456789" 在该族下的标准值 = 0x6F91（不是 CCITT-FALSE 的 0x29B1）。 */
     const uint8_t ascii[9] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
-    check(imu_module::protocol::crc16_ccitt_false(ascii, 9U) == 0x29B1U, "CRC check value");
+    check(get_crc16_check_sum(ascii, 9U, 0xFFFFU) == 0x6F91U, "CRC check value");
 
     /* CAN 三帧：基址 0x300 + node*0x10 */
     imu_module::protocol::can_frame_t cans[imu_module::protocol::kCanFrameCount] = {};

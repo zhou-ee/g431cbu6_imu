@@ -226,21 +226,6 @@ SECTIONS
   PROVIDE( __bss_start = __tbss_start );
   PROVIDE( __bss_size = __bss_end - __bss_start );
 
-  /* ------------------------------------------------------------------
-   * 临时诊断缓冲（imu_blackbox）：放在 .bss 之后、_user_heap_stack 之前。
-   * 这样它既不计入 .bss 大小（不挤压 FreeRTOS 堆），又落在真实存在的
-   * RAM 里（不会被主栈生长覆盖）。
-   * 【诊断专用，验证完随 imu_blackbox.h / ins_service.cpp 里的记录代码一起删除】
-   * ------------------------------------------------------------------ */
-  .bbuf (NOLOAD) :
-  {
-    . = ALIGN(4);
-    *(.bbuf)
-    *(.bbuf*)
-    . = ALIGN(4);
-    _ebbuf = .;
-  } >RAM
-
   /* User_heap_stack section, used to check that there is enough RAM left */
   ._user_heap_stack (NOLOAD) :
   {

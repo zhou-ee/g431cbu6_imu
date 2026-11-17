@@ -17,7 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "imu_snapshot.h"
+#include "imu_fusion.h"   /* 快照类型随融合模块 */
 
 namespace imu_module
 {
@@ -68,9 +68,11 @@ uint32_t can_base_id(uint8_t node_id);
 
 /* ------------------------------ 工具 ------------------------------ */
 
-/** CRC-16/CCITT-FALSE：poly 0x1021、init 0xFFFF、refin/refout=false、xorout=0。
- *  校验向量：ASCII "123456789" → 0x29B1。 */
-uint16_t crc16_ccitt_false(const uint8_t *data, std::size_t len);
+/** UART 帧 CRC 由 PYRo/Algorithm/CRC 提供（pyro_crc.h）：
+ *  `append_crc16_check_sum(frame, 26)` 计算前 24 字节并把结果写入末尾两字节，
+ *  低字节在前。**本层不再自带 CRC 实现**，算法参数以 PYRo 中的定义为准。
+ *  该实现属反射查表族（poly 0x1021 反射、init 0xFFFF、无 xorout），
+ *  与 CRC-16/CCITT-FALSE 不兼容；对端正式发布协议时须按此参数对接。 */
 
 /** 就近取整、中点远离零，并限幅到 [low, high]。
  *  非有限值（NaN/±Inf）返回 0：它们是上游故障信号，不应伪装成合法的饱和码值，

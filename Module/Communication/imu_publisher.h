@@ -17,8 +17,10 @@
 
 #include <cstdint>
 
+#include "FreeRTOS.h"
 #include "imu_protocol.h"
 #include "pyro_core_def.h"
+#include "semphr.h"
 
 namespace imu_module
 {
@@ -27,6 +29,13 @@ class publisher_t
 {
   public:
     static publisher_t &instance();
+
+    /** 绑定"有新快照"的唤醒信号量（由 imu_module.cpp 创建并传入）。
+     *  必须在 init() 之前调用；未绑定时发布任务退化为 1 ms 轮询。 */
+    void set_wake_semaphore(SemaphoreHandle_t sem) { _wake = sem; }
+
+    /** 当前绑定的唤醒信号量（发布任务循环内读取；nullptr 表示退化为轮询）。 */
+    [[nodiscard]] SemaphoreHandle_t wake_semaphore() const { return _wake; }
 
     /** 初始化传输层并创建常驻发布任务。仅可在调度器启动后的任务上下文调用。
      *  @retval PYRO_OK 成功；PYRO_ERROR 总线初始化/任务创建失败 */
@@ -37,7 +46,8 @@ class publisher_t
   private:
     publisher_t() = default;
     friend class pub_task_t;
-    bool _started = false;
+    bool              _started = false;
+    SemaphoreHandle_t _wake    = nullptr;  /**< 有新快照时由融合任务 give */
 };
 
 } // namespace imu_module

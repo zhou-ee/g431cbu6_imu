@@ -4,7 +4,7 @@
  *
  * 归属产品装配层，是"这个产品怎么装、怎么采、怎么发"的唯一真源。
  * 驱动（PYRo/Component/IMU）与算法（PYRo/Algorithm）都不读本文件：
- * 它们的参数由 ins_service 在 init() 时装配进去，换产品只改这里
+ * 它们的参数由 capture/fusion 在 init() 时装配进去，换产品只改这里
  * （装配方向在 imu_mount.h）。
  *
  * 参考结构：Wheel_leg 的 `ins_config_t`（产品层把配置交给 INS 组件）。
@@ -94,7 +94,7 @@ constexpr uint16_t kPublisherTaskStackWords  = 384U;
 constexpr uint32_t kCpuMhz = 170U;         /* DWT 周期 → 微秒换算 */
 
 /* 板级绑定：片选由产品装配层决定（CubeMX 中 PA4 初始为高）。 */
-/* 这两个常量放在 ins_service.cpp，因为它们需要 CubeMX 的 GPIO 类型。 */
+/* 这两个常量放在 imu_capture.cpp，因为它们需要 CubeMX 的 GPIO 类型。 */
 
 /* ============================ 参数装配 ============================ */
 

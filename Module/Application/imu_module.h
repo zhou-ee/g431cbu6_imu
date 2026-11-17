@@ -4,7 +4,7 @@
  *
  * 分层与职责（依赖方向 Module → PYRo → CubeMX）：
  *   Application/  本文件：初始化顺序与产品运行状态
- *   IMU/          ins_service_t：采集 + 融合 + 装配归一化 + 航向归零 + 统一快照
+ *   IMU/          imu_capture（器件+采集）· imu_fusion（融合+归零+快照）
  *   Communication/imu_protocol（纯编解码）+ imu_publisher（1 kHz CAN/UART 发布）
  *   Config/       编译期产品参数与装配方向映射
  *

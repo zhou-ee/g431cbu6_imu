@@ -2,7 +2,7 @@
  * @file    imu_publisher.cpp
  * @brief   1 kHz 测量发布实现：取快照 → 编码 → CAN/UART 提交。
  *
- * 与 INS 服务的关系：本任务只读 `ins_service_t::snapshot()`（值拷贝，seqlock 保证
+ * 与融合侧的关系：本任务只读 fusion::snapshot()（值拷贝，seqlock 保证
  * 同拍完整），不触碰驱动与算法状态，因此发布抖动不会影响采集周期。
  */
 
@@ -12,14 +12,14 @@
 
 #include "FreeRTOS.h"
 #include "imu_config.h"
-#include "ins_service.h"
+#include "imu_fusion.h"
 #include "pyro_bsp_can.h"
 #include "pyro_bsp_uart.h"
 #include "pyro_task.h"
 #include "task.h"
 
 /* ======================= 调试观测变量 =======================
- * 放全局作用域（理由同 ins_service.cpp）：extern "C" 定义若留在命名空间里，
+ * 放全局作用域（理由同 imu_capture.cpp）：extern "C" 定义若留在命名空间里，
  * 调试器记的名字与 ELF 裸名字对不上。 */
 extern "C" {
 volatile uint32_t imu_pub_frames       = 0U;
@@ -88,13 +88,36 @@ class pub_task_t final : public pyro::task_base_t
 
     void run_loop() override
     {
-        TickType_t wake    = xTaskGetTickCount();
-        uint32_t   divisor = 0U;
+        uint32_t divisor = 0U;
         for (;;)
         {
+            /* 等待"融合产出了新快照"。由 imu_module.cpp 把算法任务与本任务
+             * 用同一对信号量连起来：算法任务在 fuse_once() 返回 true 时 give。
+             *
+             * 这样做的三点好处：
+             *   ① 无竞态——被唤醒时快照刚写好，读到的必是最新一份；
+             *   ② 不空转——融合若降频，发布不会抢在它前面反复编码旧数据；
+             *   ③ 发出的永远是最新数据，而不是"上一拍算完、这一拍才发"。
+             *
+             * 未绑定信号量时（独立测试/单任务退化）退回 1 ms 轮询。 */
+            if (publisher_t::instance().wake_semaphore() != nullptr)
+            {
+                if (xSemaphoreTake(publisher_t::instance().wake_semaphore(),
+                                   portMAX_DELAY) != pdTRUE)
+                {
+                    continue;
+                }
+            }
+            else
+            {
+                /* 退化路径：未绑定信号量时按 1 ms 轮询（独立测试用） */
+                TickType_t tick = xTaskGetTickCount();
+                vTaskDelayUntil(&tick, config::kPublishPeriodMs);
+            }
+
             /* 快照是值拷贝：与采集任务零共享，读侧不会阻塞写侧。
              * 若采集尚未产出（valid=false），快照里 quat 会被协议层置零。 */
-            const imu_snapshot_t snapshot = ins_service_t::instance().snapshot();
+            const imu_snapshot_t snapshot = fusion::snapshot();
             const protocol::payload_t payload = protocol::encode_payload(snapshot);
             imu_pub_snapshot_seq = snapshot.sequence;
 
@@ -190,7 +213,8 @@ class pub_task_t final : public pyro::task_base_t
                 imu_pub_stack_free = uxTaskGetStackHighWaterMark(nullptr);
             }
 
-            vTaskDelayUntil(&wake, config::kPublishPeriodMs);
+            /* 循环回到顶部等下一个信号量，不再自己延时：
+             * 节拍由融合完成事件驱动，这是"发最新数据"与"无竞态"的来源。 */
         }
     }
 };
