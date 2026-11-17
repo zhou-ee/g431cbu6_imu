@@ -185,8 +185,8 @@ poly 0x1021 反射、init 0xFFFF、无 xorout，校验向量 `123456789` → `0x
 | 验证 | 方法 | 结果 |
 |---|---|---|
 | 协议字节向量 | 主机 g++ 编译 imu_protocol.cpp + PYRo CRC | 32 checks / 0 fail；3775 万组原码回环误差恒 0（测试文件已随 Module/tests 移除，判据留档）|
-| VQF/ESKF 数值 | `python PYRo/tests/run_vqf_eskf.py` | 8 个用例全通过，`sizeof(vqf_t)=3120 B` |
-| SPSC 并发 | `python PYRo/tests/run_spsc_test.py` | 400 万样本无撕裂/乱序/丢失；变异测试确认判据有效 |
+| VQF/ESKF 数值 | `run_vqf_eskf.py`（已移出发布包）| 8 个用例全通过，`sizeof(vqf_t)=3120 B` |
+| SPSC 并发 | `run_spsc_test.py`（已移出发布包）| 400 万样本无撕裂/乱序/丢失；变异测试确认判据有效 |
 | 采集解耦 | 上板实测 | `cap_rounds` 与 `algo_rounds` 独立，采集稳 1000.4 Hz |
 | UART CRC | 上板抓帧 + 独立复算 | `0xB0BE` 与线上帧尾一致 |
 

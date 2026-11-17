@@ -211,7 +211,7 @@ ESKF 使用现有 `kf_t<6,3,true>` 计算线性化误差状态，采用 Cholesky
 在仓库根目录执行，需要 Python 3 与本机 gcc/g++，使用仓库内 CMSIS-DSP 标量实现，产物写入临时目录。
 
 ```sh
-python PYRo/tests/run_vqf_eskf.py
+python <备份目录>/PYRo_tests/run_vqf_eskf.py   # 测试已移出发布包，见仓库外层 test/
 ```
 
 覆盖平移加速、振动、冲击、倒置初始化、真实三轴转动、静止/运动零偏、带噪声动态、异频流、环形批次、时间戳回绕、非法参数及数值失败回滚。

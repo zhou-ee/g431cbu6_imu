@@ -85,7 +85,7 @@ Module/
 ```powershell
 $env:PATH = "<mingw64>\bin;" + $env:PATH
 python Module/tests/run_protocol_test.py     # 协议 v1：字节向量 + 原码回环
-python PYRo/tests/run_vqf_eskf.py            # VQF/ESKF 数值回归
+python <备份目录>/PYRo_tests/run_vqf_eskf.py   # VQF/ESKF 数值回归
 ```
 
 `run_protocol_test.py` 覆盖四类结论，全部通过：
