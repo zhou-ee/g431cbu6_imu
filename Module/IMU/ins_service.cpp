@@ -65,6 +65,8 @@ volatile float    imu_service_pitch          = 0.0f;
 volatile float    imu_service_yaw            = 0.0f;
 volatile uint32_t imu_service_rest           = 0U;
 volatile float    imu_service_rest_t         = 0.0f;
+volatile float    imu_service_rest_gyr_lp[3] = {0.0f, 0.0f, 0.0f};
+volatile float    imu_service_rest_acc_lp[3] = {0.0f, 0.0f, 0.0f};
 volatile uint32_t imu_service_heading_zeroed  = 0U;
 volatile uint32_t imu_service_heading_quality = 0U;
 volatile float    imu_service_acc_confidence  = 0.0f;
@@ -604,6 +606,13 @@ void ins_service_t::_round()
         imu_service_yaw   = yaw;
         imu_service_rest  = state.rest_detected ? 1U : 0U;
         imu_service_rest_t        = state.rest_t;
+        /* 静止参考低通的当前值（器件系）。诊断 yaw 突变的关键观测量：
+         * _correct_rest 的残差 = rest_gyr_lp − bias，运动刚结束时该值仍带残余。 */
+        for (uint8_t i = 0U; i < 3U; ++i)
+        {
+            imu_service_rest_gyr_lp[i] = state.rest_gyr_lp[i];
+            imu_service_rest_acc_lp[i] = state.rest_acc_lp[i];
+        }
         imu_service_heading_zeroed  = _heading.zeroed ? 1U : 0U;
         imu_service_heading_quality = _heading.quality;
         imu_service_acc_confidence  = state.acc_confidence;

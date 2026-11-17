@@ -27,8 +27,16 @@ namespace config
 
 /* ============================ 器件与采样 ============================
  * 两路 ODR 相同（驱动按同一时间戳合并）。1920 Hz 是实测 1 ms 预算下的取值：
- * update() 平均 518 µs、峰值 793 µs（Release），7680 Hz 需先压低单批成本。
- * 样本环形缓冲容量在驱动内（64 帧），与 ODR 的匹配关系见 lsm6dsv16x_drv.h。 */
+ * update() 平均 553 µs、峰值 835 µs（Release，1920 Hz）。
+ *
+ * 2026-11-17 做过 7680 Hz 的 A/B 实测（诊断后已回退），结论记录在此避免重复踩：
+ *   · 双任务拆分生效——采集仍稳在 1000.5 Hz、cap_us max 358 µs，不受融合影响；
+ *   · 但 update() 涨到 avg 6528 / max 8333 µs，约为 1920 Hz 的 12 倍
+ *     （非线性：陀螺逐样本传播，样本数 ×4 而单拍耗时 ×12）；
+ *   · SPSC 缓冲随即被打爆：err_data 以约 1000 次/秒增长，融合实际频率掉到 ~120 Hz。
+ * 因此 7680 Hz 在压低单批成本之前不可用。
+ * 另：该实验也否证了"算力不足来自运动零偏校准"的猜测——当时
+ * motion_bias_est_enabled 已关闭，耗时仍为 8.3 ms。 */
 constexpr uint16_t kAccRangeG    = 4U;     /* ±g */
 constexpr uint16_t kAccOdrHz     = 1920U;
 constexpr uint16_t kGyroRangeDps = 2000U;  /* ±°/s */
@@ -118,7 +126,40 @@ inline pyro::vqf_t::config_t vqf_config()
     cfg.rest_th_gyr  = 5.0f;   /* °/s */
     cfg.rest_th_acc  = 1.0f;   /* m/s² */
     cfg.bias_clip    = 5.0f;   /* °/s，与 rest_th_gyr 匹配 */
-    cfg.motion_bias_est_enabled = true;
+
+    /* 静止检测低通的时间常数（原默认 0.5 s）。
+     *
+     * 2026-11-17 改为 0.15 s——修 "运动后静止，yaw 突变 0.45~1.6°"。
+     *
+     * 根因（yaw_full.csv 实测，i=7837，rest 0->1 那一拍）：
+     *   bias_z    = +0.002395   （当前估计，接近真值 +0.002237）
+     *   rest_lp_z = -0.001129   （低通后的静止参考，**符号都是错的**）
+     *   残差 = rest_lp_z − bias_z = -0.003523 rad/s
+     * 运动中 |gyro| 峰值 20 rad/s，而 τ=0.5 s 的二阶低通需要约 3~5τ
+     * （1.5~2.5 s）才收敛；rest_min_t 只等 1.0 s（= 2τ），残余未衰减完，
+     * 于是 _correct_rest 把这个残余当成零偏真值，把 bias 拉向错误方向，
+     * yaw 以错误速率积分——表现为静止后 0.5 s 内 yaw 突变。
+     *
+     * 把 τ 降到 0.15 s 后，收敛时间缩到 0.45~0.75 s，1.0 s 的等待已足够
+     * （约 6.7τ）。代价：低通更"薄"，静止判据对瞬时噪声更敏感；
+     * 若实测静止判决变得难以建立（rest_t 反复清零），应放宽 rest_th_gyr
+     * 或适当提高 rest_min_t。 */
+    cfg.rest_filter_tau = 0.15f;
+    /* 运动中是否允许倾斜观测修正零偏。
+     *
+     * 2026-11-17 关闭（true -> false），与 lsm6dsv_test/vqf_test.cpp 对齐——
+     * 那个工程用 false，实测没有"静止后 yaw 突变"的问题。
+     *
+     * 作用点：pyro_algo_vqf.cpp:_gate() 的
+     *     if (!motion_bias_est_enabled || rest_detected) { 零偏行 K 清零 }
+     * true 时运动中保留零偏行，倾斜观测可通过交叉协方差 P01 改 bias_z；
+     * false 时零偏只由静止观测（_correct_rest）修改。
+     *
+     * 实测代价很小：yaw_30s.csv 里运动 8 s，该通道只把 bias_z 改了
+     * 0.000047 rad/s（0.0027 °/s），且运动段 acc_rej=1 占 62.9%，
+     * 大部分时间根本执行不到。因此关闭它不会损失有效的零偏估计能力，
+     * 但能排除"多一条 bias_z 修改通道"这个变量，便于定位 yaw 突变。 */
+    cfg.motion_bias_est_enabled = false;
     cfg.rest_bias_est_enabled   = true;
     cfg.acc_update_period = 0.002f;
     return cfg;

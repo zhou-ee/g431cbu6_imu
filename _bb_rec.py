@@ -34,20 +34,21 @@ OPENOCD = "openocd"
 BASE = 0x2000569C
 NWORDS = 36
 
-# word 下标（已实测校准）
 IDX = {
     "acc_rej": 0, "nis": 1, "acc_conf": 2, "hz_quality": 3, "hz_zeroed": 4,
-    "rest_t": 5, "rest": 6, "yaw": 7, "pitch": 8,
-    "roll": 9,
-    "bias_x": 10, "bias_y": 11, "bias_z": 12,
-    "gyro_x": 13, "gyro_y": 14, "gyro_z": 15,
-    "acc_x": 16, "acc_y": 17, "acc_z": 18,
-    "cap_us_avg": 19, "cap_us_max": 20, "cap_rounds": 21,
-    "cap_stack": 22, "ins_stack": 23, "heap_free": 24,
-    "loop_us_avg": 25, "vqf_us_avg": 26, "vqf_us_max": 27,
-    "vqf_status": 28, "vqf_warn": 29, "vqf_err": 30,
-    "err_timeout": 31, "err_backpressure": 32, "err_ovr": 33,
-    "err_data": 34, "err_bus": 35,
+    # rest_acc_lp[3] @ +20B
+    "rest_acc_lp_x": 5, "rest_acc_lp_y": 6, "rest_acc_lp_z": 7,
+    # rest_gyr_lp[3] @ +32B —— _correct_rest 的观测源，诊断核心
+    "rest_lp_x": 8, "rest_lp_y": 9, "rest_lp_z": 10,
+    "rest_t": 11, "rest": 12,
+    "yaw": 13, "pitch": 14, "roll": 15,
+    "bias_x": 16, "bias_y": 17, "bias_z": 18,
+    "gyro_x": 19, "gyro_y": 20, "gyro_z": 21,
+    "acc_x": 22, "acc_y": 23, "acc_z": 24,
+    "cap_us_avg": 25, "cap_us_max": 26, "cap_rounds": 27,
+    "cap_stack": 28, "ins_stack": 29, "heap_free": 30,
+    "loop_us_avg": 31, "vqf_us_avg": 32, "vqf_us_max": 33,
+    "vqf_status": 34, "vqf_warn": 35,
 }
 
 
@@ -151,13 +152,17 @@ def main():
             rows.append({
                 "t_host": round(time.time() - t0, 4),
                 "tick_ms": tk[0] if tk else 0,
-                "roll": f32(a[IDX["roll"]]),
-                "pitch": f32(a[IDX["pitch"]]),
                 "yaw": f32(a[IDX["yaw"]]),
+                "pitch": f32(a[IDX["pitch"]]),
+                "roll": f32(a[IDX["roll"]]),
                 "rest": a[IDX["rest"]],
                 "rest_t": f32(a[IDX["rest_t"]]),
-                "hz_zeroed": a[IDX["hz_zeroed"]],
-                "hz_quality": a[IDX["hz_quality"]],
+                "rest_lp_x": f32(a[IDX["rest_lp_x"]]),
+                "rest_lp_y": f32(a[IDX["rest_lp_y"]]),
+                "rest_lp_z": f32(a[IDX["rest_lp_z"]]),
+                "rest_acc_lp_x": f32(a[IDX["rest_acc_lp_x"]]),
+                "rest_acc_lp_y": f32(a[IDX["rest_acc_lp_y"]]),
+                "rest_acc_lp_z": f32(a[IDX["rest_acc_lp_z"]]),
                 "acc_conf": f32(a[IDX["acc_conf"]]),
                 "nis": f32(a[IDX["nis"]]),
                 "acc_rej": a[IDX["acc_rej"]],
@@ -179,7 +184,6 @@ def main():
                 "vqf_us_avg": a[IDX["vqf_us_avg"]],
                 "vqf_us_max": a[IDX["vqf_us_max"]],
                 "vqf_warn": a[IDX["vqf_warn"]],
-                "err_data": a[IDX["err_data"]],
             })
         tn.close()
     finally:

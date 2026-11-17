@@ -141,6 +141,12 @@ extern volatile float    imu_service_pitch;            /* ° */
 extern volatile float    imu_service_yaw;              /* °（已归零） */
 extern volatile uint32_t imu_service_rest;             /* 1=当前静止 */
 extern volatile float    imu_service_rest_t;           /* 静止计时，s */
+/* 静止检测的两个低通参考（器件系，rad/s 与 m/s²）。
+ * rest_gyr_lp 是 _correct_rest 的观测源：残差 = rest_gyr_lp − bias。
+ * 它由 rest_filter_tau（0.5 s）低通而来，运动刚结束时仍带残余，
+ * 这是"静止判决建立瞬间 bias 被拉偏"的关键观测量——诊断 yaw 突变必须看它。 */
+extern volatile float    imu_service_rest_gyr_lp[3];   /* 低通后的静止参考角速度 */
+extern volatile float    imu_service_rest_acc_lp[3];   /* 低通后的静止参考加速度 */
 extern volatile uint32_t imu_service_heading_zeroed;   /* 1=yaw 零点已建立 */
 extern volatile uint32_t imu_service_heading_quality;  /* 0/1/2 */
 extern volatile float    imu_service_acc_confidence;   /* 加速度可信度，0..1 */
