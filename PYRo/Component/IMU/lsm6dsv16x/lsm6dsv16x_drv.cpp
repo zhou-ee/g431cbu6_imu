@@ -293,6 +293,44 @@ bool lsm6dsv16x_drv_t::read_fifo_batch() {
         return false; /* 器件尚未产生新样本：不是错误 */
     }
 
+    /* ---- ②b 积压保护：单次回读字数超限则整批丢弃 ----
+     *
+     * 正常 1 ms 一拍只有 2~3 个字。一旦 diff 远超此值，说明本任务曾被长时间
+     * 阻塞（调度延迟、总线异常、断点停机等），器件 FIFO 里积的还是旧数据。
+     * 这些数据同时压垮软件环形缓冲与算法（每样本一次协方差传播），
+     * 而且"陈旧的一大批"对姿态解算没有价值——最新数据才重要。
+     *
+     * 因此整批抛弃，并且【必须排空器件 FIFO】：只丢不解的话，下一拍 diff
+     * 依然超限，会永久卡在这个分支里采集不到任何数据。
+     * 排空方式 = 按当前 diff 发起一次丢弃读（读到 _fifo_raw 里随即忽略），
+     * 单次最多 MAX_WORDS_PER_XFER 字，若仍未排空则留到下一拍继续。
+     * 这段不做解析，因此不产生样本、不动 pend_ts。 */
+    const uint16_t cap = _data.cfg.fifo_max_words_per_read;
+    if (cap != 0U && diff > cap) {
+        ++_fifo.err_data;
+        ++_fifo.err_overrun; /* 独立计数：区分"积压丢弃"与"缓冲背压" */
+
+        uint16_t drain_words = diff;
+        if (drain_words > LSM6DSV16X_MAX_WORDS_PER_XFER) {
+            drain_words = LSM6DSV16X_MAX_WORDS_PER_XFER;
+        }
+        uint16_t drained = 0U;
+        if (!_device.read_fifo(_fifo_raw, sizeof(_fifo_raw),
+                               static_cast<uint16_t>(drain_words * 7U), drained)) {
+            ++_fifo.err_bus;
+            return false;
+        }
+        if (!_device.wait_dma(LSM6DSV16X_CPLT_TIMEOUT_MS)) {
+            ++_fifo.err_timeout;
+            return false;
+        }
+        if (!_device.read_fifo(_fifo_raw, sizeof(_fifo_raw), 0U, drained)) {
+            ++_fifo.err_bus;
+            return false;
+        }
+        return false; /* 本拍不交付任何样本 */
+    }
+
     /* 本拍请求长度：≤ MAX_WORDS_PER_XFER 字（一笔 DMA 装得下），剩余下拍续读 */
     uint16_t words = diff;
     if (words > LSM6DSV16X_MAX_WORDS_PER_XFER) {

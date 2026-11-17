@@ -43,6 +43,12 @@ constexpr uint16_t kGyroRangeDps = 2000U;  /* ±°/s */
 constexpr uint16_t kGyroOdrHz    = 1920U;
 constexpr bool     kFifoEnabled  = true;   /* false = 输出寄存器直读回退路径 */
 
+/* 单次回读的最大 FIFO 字数。超过则整批丢弃并排空器件 FIFO（见驱动注释）。
+ * 1920 Hz 下 1 ms ≈ 4 字（gyro + acc + timestamp），16 字 ≈ 8 倍余量：
+ * 既能容忍偶发调度抖动，又能在真正积压时及时止损，避免陈旧样本一次性
+ * 涌入压垮软件环形缓冲与算法。设为 0 表示不限制。 */
+constexpr uint16_t kFifoMaxWordsPerRead = 16U;
+
 /* 上电标定：默认关闭，零偏交给 VQF 的静止/运动联合估计。
  * 若开启，标定期间器件必须静止，kCalibrateTimes 个样本后结束
  * （1920 Hz 下 500 个约 260 ms）。 */
@@ -110,6 +116,7 @@ inline imu_cfg_t driver_config()
     cfg.gyro_range      = kGyroRangeDps;
     cfg.gyro_freq       = kGyroOdrHz;
     cfg.fifo_en         = kFifoEnabled;
+    cfg.fifo_max_words_per_read = kFifoMaxWordsPerRead;
     return cfg;
 }
 

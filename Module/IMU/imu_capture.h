@@ -64,6 +64,7 @@ struct diag_t
     uint32_t err_timeout;
     uint32_t err_ovr;
     uint32_t err_backpressure;
+    uint32_t err_overrun;
 };
 diag_t diag();
 uint32_t cap_rounds();
@@ -98,6 +99,7 @@ extern volatile uint32_t imu_service_err_timeout;    /* 等完成通知超时次
 extern volatile uint32_t imu_service_err_data;       /* 数据异常合计 */
 extern volatile uint32_t imu_service_err_ovr;        /* 其中：器件 FIFO 溢出 */
 extern volatile uint32_t imu_service_err_backpressure; /* 其中：缓冲满丢新样 */
+extern volatile uint32_t imu_service_err_overrun;      /* 其中：单次回读超限整批丢弃 */
 extern volatile int32_t  imu_service_init_result;    /* 采集初始化结果 0=成功 */
 extern volatile uint32_t imu_service_heap_free_min;  /* 任务拉起后的 FreeRTOS 堆余量 */
 }

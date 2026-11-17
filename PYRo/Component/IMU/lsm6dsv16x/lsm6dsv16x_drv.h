@@ -60,14 +60,15 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
      * err_data 是合计数；err_ovr / err_backpressure 用来区分成因。 */
     struct diag_t {
         uint32_t err_bus;          /* 总线失败（状态读或帧读失败） */
-        uint32_t err_data;         /* 数据异常合计（见下方两个分项） */
+        uint32_t err_data;         /* 数据异常合计（见下方各分项） */
         uint32_t err_timeout;      /* 等完成通知超时（DMA 未在期限内完成） */
         uint32_t err_ovr;          /* 其中：器件 FIFO 溢出（整拍未被读走） */
         uint32_t err_backpressure; /* 其中：软件缓冲满、丢弃新样本（消费者跟不上） */
+        uint32_t err_overrun;      /* 其中：单次回读字数超限，整批丢弃并排空 */
     };
     [[nodiscard]] diag_t diag() const {
         return {_fifo.err_bus, _fifo.err_data, _fifo.err_timeout, _fifo.err_ovr,
-                _fifo.err_backpressure};
+                _fifo.err_backpressure, _fifo.err_overrun};
     }
 
     /** 清零累计错误计数（不动 ovr_prev 边沿状态与 pend_ts）。
@@ -79,6 +80,7 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
         _fifo.err_timeout = 0U;
         _fifo.err_ovr = 0U;
         _fifo.err_backpressure = 0U;
+        _fifo.err_overrun = 0U;
     }
 
     private:
@@ -128,15 +130,19 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
      * 本拍的状态字节、待读字数、交付字节数都是 read() 内的局部量，不落成员。 */
     struct fifo_state_t {
         volatile uint32_t err_bus;     /* 总线失败次数 */
-        volatile uint32_t err_data;    /* 数据异常合计 = err_ovr + err_backpressure + 未知 TAG */
+        volatile uint32_t err_data;    /* 数据异常合计（下面各分项之和 + 未知 TAG） */
         volatile uint32_t err_timeout; /* 等完成通知超时次数 */
-        /* ---- 分类计数（err_data 的两个主要成因，现场必须能分开归因）----
+        /* ---- 分类计数（err_data 的主要成因，现场必须能分开归因）----
          * err_ovr          —— 器件 FIFO 溢出：continuous 模式满后覆盖最旧，
          *                      通常意味着"一整拍没被读走"（调度抖动/总线慢）。
          * err_backpressure —— 软件缓冲满：消费者（融合任务）跟不上生产，
-         *                      即 SPSC 侧丢新样本。两者的处置完全不同。 */
+         *                      即 SPSC 侧丢新样本。
+         * err_overrun      —— 单次回读字数超过 cfg.fifo_max_words_per_read，
+         *                      整批丢弃并排空器件 FIFO（防积压淹没算法）。
+         * 三者处置完全不同：ovr 查采集时序，backpressure 查算力，overrun 查卡顿。 */
         volatile uint32_t err_ovr;
         volatile uint32_t err_backpressure;
+        volatile uint32_t err_overrun;
         uint32_t pend_ts;              /* 当前槽时间戳，跨调用保持（读边界可能切在槽中间；
                                           个别槽无时间戳字时沿用上次值，下一槽即自愈）*/
         bool     ovr_prev;             /* 溢出标志（上升沿计数，兼容标志清除语义）*/

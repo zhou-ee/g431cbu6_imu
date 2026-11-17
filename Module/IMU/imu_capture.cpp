@@ -29,6 +29,7 @@ volatile uint32_t imu_service_err_bus          = 0U;
 volatile uint32_t imu_service_err_data         = 0U;
 volatile uint32_t imu_service_err_ovr          = 0U;
 volatile uint32_t imu_service_err_backpressure = 0U;
+volatile uint32_t imu_service_err_overrun      = 0U;
 volatile uint32_t imu_service_err_timeout      = 0U;
 volatile uint32_t imu_service_heap_free_min    = 0U;
 }
@@ -109,6 +110,7 @@ void capture_once()
     imu_service_err_timeout      = dg.err_timeout;
     imu_service_err_ovr          = dg.err_ovr;
     imu_service_err_backpressure = dg.err_backpressure;
+    imu_service_err_overrun      = dg.err_overrun;
 
     /* 采集侧耗时（含两段 DMA 等待，是"采集是否守住 1 ms"的直接口径）。 */
     const uint32_t us = static_cast<uint32_t>(
@@ -170,7 +172,8 @@ const float *last_gyro_dev()
 diag_t diag()
 {
     const lsm6dsv16x_drv_t::diag_t d = s_imu.diag();
-    return {d.err_bus, d.err_data, d.err_timeout, d.err_ovr, d.err_backpressure};
+    return {d.err_bus, d.err_data, d.err_timeout, d.err_ovr, d.err_backpressure,
+            d.err_overrun};
 }
 
 uint32_t cap_rounds()      { return imu_service_cap_rounds; }
@@ -187,6 +190,7 @@ void clear_error_counters()
     imu_service_err_timeout      = 0U;
     imu_service_err_ovr          = 0U;
     imu_service_err_backpressure = 0U;
+    imu_service_err_overrun      = 0U;
 }
 
 } // namespace capture

@@ -23,6 +23,19 @@ struct imu_cfg_t {
     uint16_t gyro_range{};  // 单位 dps
     uint16_t gyro_freq{};   // 单位 Hz
     bool fifo_en{};
+
+    /* 单次回读的最大 FIFO 字数（硬上限，超过则整批丢弃并排空器件 FIFO）。
+     *
+     * 为什么需要它：正常 1 ms 一拍只产生 2~3 个字（gyro + acc + timestamp）。
+     * 若调度被长时间阻塞（或总线异常），器件 FIFO 会累积到上百字，一次全部
+     * 涌入会同时压垮软件环形缓冲（64 帧）与算法（每样本跑一次协方差传播），
+     * 表现为 err_backpressure 暴涨 + 融合耗时尖峰，随后还要多拍才能追平。
+     * 这种情况下最新数据比"完整但陈旧的一大批"更有价值，因此整批抛弃。
+     *
+     * 取值依据：1920 Hz 下 1 ms ≈ 4 个字（两路 + 时间戳），
+     * 16 字 ≈ 8 倍余量，既能容忍偶发抖动，又能在真正积压时及时止损。
+     * 设为 0 表示不限制（退回旧的"最多读 MAX_WORDS_PER_XFER 字"行为）。 */
+    uint16_t fifo_max_words_per_read = 16U;
 };
 
 struct imu_cali_t {
