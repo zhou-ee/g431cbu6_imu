@@ -58,13 +58,26 @@ template <std::size_t N> matrix_t<N, N> identity(float scale = 1.0f)
     return result;
 }
 
-vqf_t::quaternion_t rotation_step(const vector_t<3> &angle)
+/* 角增量 → 旋转四元数。可选输出半角 sin/cos 供 _compute_left_jacobian 复用，
+ * 免去它在同一角度上再算一次 sinf/cosf（见 .h 里 _trig_* 的说明）。 */
+vqf_t::quaternion_t rotation_step(const vector_t<3> &angle,
+                                  float *out_sin_h = nullptr,
+                                  float *out_cos_h = nullptr)
 {
     const float magnitude = norm(angle);
     if (magnitude < 1.0e-6f)
+    {
+        if (out_sin_h != nullptr) { *out_sin_h = 0.5f * magnitude; }
+        if (out_cos_h != nullptr) { *out_cos_h = 1.0f; }
         return normalized({1.0f, 0.5f * angle[0], 0.5f * angle[1], 0.5f * angle[2]});
-    const float scale = sinf(0.5f * magnitude) / magnitude;
-    return {cosf(0.5f * magnitude), scale * angle[0], scale * angle[1], scale * angle[2]};
+    }
+    const float half      = 0.5f * magnitude;
+    const float sin_h     = sinf(half);
+    const float cos_h     = cosf(half);
+    if (out_sin_h != nullptr) { *out_sin_h = sin_h; }
+    if (out_cos_h != nullptr) { *out_cos_h = cos_h; }
+    const float scale = sin_h / magnitude;
+    return {cos_h, scale * angle[0], scale * angle[1], scale * angle[2]};
 }
 
 // 将单位方向转向 +Z 的最短旋转向量，取水平两维作为倾斜新息。
@@ -388,7 +401,16 @@ status_t vqf_t::_rotate_covariance()
  *   J_l(v) = I + (1-cos|v|)/|v|²·[v]x + (|v|-sin|v|)/|v|³·[v]x²
  * 逐元素形式与原来的表达式 `identity + skew*first + (skew*skew)*second`
  * 保持相同的乘加顺序，因此结果逐位不变。
- * 返回码：矩阵乘法失败时返回错误（原实现走 operator*，失败被静默吞掉）。 */
+ * 返回码：矩阵乘法失败时返回错误（原实现走 operator*，失败被静默吞掉）。
+ *
+ * trig 复用（2026-11-17）：_update_gyr 在同一个样本上先后调用 rotation_step()
+ * （用半角 h=|v|/2 求 sin/cos）与本函数（用全角 |v| 求 sin/cos），
+ * 两套超越函数共 4 次调用。现由 rotation_step 把 sin/cos(h) 算出来经
+ * _trig 传进来，本函数用半角公式反推：
+ *   sin|v| = 2·sh·ch,  cos|v| = ch² - sh²
+ * 每样本省下 2 次 sinf/cosf（M4F 上各约 20~30 周期）。
+ * 半角公式在 |v|→0 时无精度问题（sin|v|→0、cos|v|→1），且小角分支
+ * 仍走下面的泰勒展开，不参与此路径。 */
 status_t vqf_t::_compute_left_jacobian(const vector3_t &angle)
 {
     const float squared = square(angle[0]) + square(angle[1]) + square(angle[2]);
@@ -397,8 +419,22 @@ status_t vqf_t::_compute_left_jacobian(const vector3_t &angle)
     if (squared > 1.0e-4f)
     {
         const float magnitude = sqrtf(squared);
-        first = (1.0f - cosf(magnitude)) / squared;
-        second = (magnitude - sinf(magnitude)) / (squared * magnitude);
+        /* 由调用方预先算好的半角三角函数反推全角值；
+         * 若调用方未提供（_trig_valid == false）则退回直接计算。 */
+        float sin_m;
+        float cos_m;
+        if (_trig_valid)
+        {
+            sin_m = 2.0f * _trig_sin * _trig_cos;
+            cos_m = square(_trig_cos) - square(_trig_sin);
+        }
+        else
+        {
+            sin_m = sinf(magnitude);
+            cos_m = cosf(magnitude);
+        }
+        first = (1.0f - cos_m) / squared;
+        second = (magnitude - sin_m) / (squared * magnitude);
     }
     _skew(0, 0) = 0.0f;     _skew(0, 1) = -angle[2]; _skew(0, 2) = angle[1];
     _skew(1, 0) = angle[2]; _skew(1, 1) = 0.0f;      _skew(1, 2) = -angle[0];
@@ -423,7 +459,13 @@ status_t vqf_t::_update_gyr(const vector3_t &gyr, float dt)
         return PYRO_PARAM_ERROR;
     if (dt > 0.0f)
     {
-        const quaternion_t next_gyr = normalized(multiply(_state.gyr_quat, rotation_step(angle)));
+        /* 一次算出半角 sin/cos，既用于本步旋转，也留给 _compute_left_jacobian
+         * 用半角公式反推全角值（省 2 次超越函数）。 */
+        _trig_valid = false;
+        const quaternion_t next_gyr =
+            normalized(multiply(_state.gyr_quat,
+                                rotation_step(angle, &_trig_sin, &_trig_cos)));
+        _trig_valid = true;
         // R_true=Exp(δθ_global)R_nom，δθ_dot=-R_nom δb-R_nom n_g。
         // 平均旋转 A=R_start J_l(ω dt)，对恒角速度积分偏置耦合。
         // 以下全部写入成员暂存（避免每样本构造/清零 matrix_t 临时量）。
@@ -729,7 +771,13 @@ status_t vqf_t::_inject_error()
 {
     const auto &delta = _error_kf.get_state();
     const vector3_t angle{delta[0], delta[1], delta[2]};
-    const auto next_acc = normalized(multiply(rotation_step(angle), _state.acc_quat));
+    /* 与 _update_gyr 同样复用半角三角函数：rotation_step 输出、雅可比反推。
+     * 这里必须显式置 _trig_valid，否则会沿用上一次 _update_gyr 的残值，
+     * 用错误的角度反推出错误的雅可比——那是静默的数值污染。 */
+    _trig_valid = false;
+    const auto next_acc =
+        normalized(multiply(rotation_step(angle, &_trig_sin, &_trig_cos), _state.acc_quat));
+    _trig_valid = true;
     const auto next_bias = _state.bias + vector3_t{delta[3], delta[4], delta[5]};
     if (!matrix::is_finite(next_acc) || !matrix::is_finite(next_bias))
         return PYRO_ERROR;

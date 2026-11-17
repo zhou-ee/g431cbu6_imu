@@ -185,6 +185,17 @@ class vqf_t
     matrix_t<3, 3> _t2{};
     matrix_t<3, 3> _t3{};
 
+    /* ---- 半角三角函数暂存（2026-11-17） ------------------------------------
+     * _update_gyr 对同一陀螺样本要算两次三角函数：
+     *   rotation_step(angle)         用半角 h = |angle|/2 的 sin/cos
+     *   _compute_left_jacobian(angle) 用全角 |angle| 的 sin/cos
+     * 让前者把 sin(h)/cos(h) 存进这两个成员并置 _trig_valid，
+     * 后者用半角公式反推全角值，省下 2 次 sinf/cosf 调用。
+     * dt>0 分支每次都会重写，不存在跨样本残留；为 false 时退回直接计算。 */
+    float _trig_sin{0.0f};
+    float _trig_cos{1.0f};
+    bool  _trig_valid{false};
+
     status_t _compute_left_jacobian(const vector3_t &angle);
     status_t _load_p_blocks();  /* 取当前 P 的四个 3×3 块 */
     status_t _propagate_covariance(); /* F·P·Fᵀ → _p_prop（3 次 3×3） */
