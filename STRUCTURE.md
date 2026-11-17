@@ -10,7 +10,7 @@ graph TB
     subgraph MOD["Module — 产品装配层"]
         APP["Application<br/>imu_module.cpp<br/>入口 · 启动定序"]
         CFG["Config<br/>imu_config.h · imu_mount.h<br/>编译期唯一真源"]
-        IMU["IMU<br/>ins_service · imu_snapshot<br/>采集+融合+归零+快照"]
+        IMU["IMU<br/>imu_capture · imu_fusion<br/>采集 / 融合+归零+快照"]
         COM["Communication<br/>imu_protocol · imu_publisher<br/>编解码 + 1kHz 发布"]
     end
     subgraph PYRO["PYRo — 通用组件层"]
@@ -147,7 +147,7 @@ graph LR
 
 ```mermaid
 flowchart TD
-    S["imu_snapshot_t<br/>安装系 + 已归零 + 解包参数"]
+    S["imu_snapshot_t（imu_fusion.h）<br/>安装系 + 已归零 + 解包参数"]
     S --> Q["四元数 ×32767 int16<br/>无效姿态置零"]
     S --> AC["加速度：Mᵀ → /Sa → 取整限幅"]
     S --> GY["角速度：Mᵀ → +b → /Sg → 取整限幅"]
@@ -170,8 +170,9 @@ poly 0x1021 反射、init 0xFFFF、无 xorout，校验向量 `123456789` → `0x
 | `Module/Application/` | 启动定序：INS → 发布 | 顺序不可交换 |
 | `Module/Config/imu_config.h` | 器件/融合/发布/任务参数 | 编译期唯一真源 |
 | `Module/Config/imu_mount.h` | 8 方向映射 + 逆表导出 | 正向表不可复用于反向 |
-| `Module/IMU/ins_service.*` | 采集、融合、归零、快照 | 双任务 + SPSC，无临界区 |
-| `Module/IMU/imu_snapshot.h` | 对外唯一数据结构 | 跨字段同拍 |
+| `Module/IMU/imu_capture.*` | 器件对象、read()、SPSC 生产、采集统计 | 唯一持有硬件的地方 |
+| `Module/IMU/imu_fusion.*` | VQF/ESKF、归一化、归零、快照 | 只消费缓冲，不碰总线 |
+
 | `Module/Communication/imu_protocol.*` | 协议 v1 编解码 | 纯函数，主机可测 |
 | `Module/Communication/imu_publisher.*` | 1 kHz CAN/UART 发布 | 忙则丢整组，不重试 |
 | `PYRo/Component/IMU/` | 驱动 + SPSC 环形缓冲 | 输出器件坐标系 |
@@ -183,7 +184,7 @@ poly 0x1021 反射、init 0xFFFF、无 xorout，校验向量 `123456789` → `0x
 
 | 验证 | 方法 | 结果 |
 |---|---|---|
-| 协议字节向量 | `python Module/tests/run_protocol_test.py` | 32 checks / 0 fail；3775 万组原码回环误差恒 0 |
+| 协议字节向量 | 主机 g++ 编译 imu_protocol.cpp + PYRo CRC | 32 checks / 0 fail；3775 万组原码回环误差恒 0（测试文件已随 Module/tests 移除，判据留档）|
 | VQF/ESKF 数值 | `python PYRo/tests/run_vqf_eskf.py` | 8 个用例全通过，`sizeof(vqf_t)=3120 B` |
 | SPSC 并发 | `python PYRo/tests/run_spsc_test.py` | 400 万样本无撕裂/乱序/丢失；变异测试确认判据有效 |
 | 采集解耦 | 上板实测 | `cap_rounds` 与 `algo_rounds` 独立，采集稳 1000.4 Hz |
