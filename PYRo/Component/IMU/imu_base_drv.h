@@ -40,9 +40,9 @@ struct imu_cfg_t {
 
 struct imu_cali_t {
     /* 陀螺静态零偏，器件坐标系，rad/s。标定在器件系进行（见 calibrate()）。 */
-    float gx_offset = -0.010767111;
-    float gy_offset = 0.013010208;
-    float gz_offset =-0.0014672983;
+    float gx_offset = 0.0f;
+    float gy_offset = 0.0f;
+    float gz_offset = 0.0f;
     /* 静止加速度模长，m/s²。目前只有 calibrate() 写入、尚无读者
      * （本产品不输出"去重力线性加速度"）。
      * 默认取标准重力而不是 0：将来按下式取线性加速度时
