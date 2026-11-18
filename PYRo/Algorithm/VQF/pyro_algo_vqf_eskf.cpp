@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2021 Daniel Laidig <laidig@control.tu-berlin.de>
 // SPDX-License-Identifier: MIT
-#include "pyro_algo_vqf.h"
+#include "pyro_algo_vqf_eskf.h"
 #include "imu_base_drv.h"
 
 #include <algorithm>
@@ -25,21 +25,21 @@ float norm(const vector_t<3> &value)
     return sqrtf(square(value[0]) + square(value[1]) + square(value[2]));
 }
 
-vqf_t::quaternion_t multiply(const vqf_t::quaternion_t &a, const vqf_t::quaternion_t &b)
+vqf_eskf_t::quaternion_t multiply(const vqf_eskf_t::quaternion_t &a, const vqf_eskf_t::quaternion_t &b)
 {
-    vqf_t::quaternion_t result;
+    vqf_eskf_t::quaternion_t result;
     arm_quaternion_product_single_f32(a.data(), b.data(), result.data());
     return result;
 }
 
-vqf_t::quaternion_t normalized(const vqf_t::quaternion_t &q)
+vqf_eskf_t::quaternion_t normalized(const vqf_eskf_t::quaternion_t &q)
 {
-    vqf_t::quaternion_t result;
+    vqf_eskf_t::quaternion_t result;
     arm_quaternion_normalize_f32(q.data(), result.data(), 1);
     return result;
 }
 
-vector_t<3> rotate(const vqf_t::quaternion_t &q, const vector_t<3> &v)
+vector_t<3> rotate(const vqf_eskf_t::quaternion_t &q, const vector_t<3> &v)
 {
     const float w = q[0], x = q[1], y = q[2], z = q[3];
     const float tx = 2.0f * (y * v[2] - z * v[1]);
@@ -60,7 +60,7 @@ template <std::size_t N> matrix_t<N, N> identity(float scale = 1.0f)
 
 /* 角增量 → 旋转四元数。可选输出半角 sin/cos 供 _compute_left_jacobian 复用，
  * 免去它在同一角度上再算一次 sinf/cosf（见 .h 里 _trig_* 的说明）。 */
-vqf_t::quaternion_t rotation_step(const vector_t<3> &angle,
+vqf_eskf_t::quaternion_t rotation_step(const vector_t<3> &angle,
                                   float *out_sin_h = nullptr,
                                   float *out_cos_h = nullptr)
 {
@@ -102,7 +102,7 @@ template <typename Sample> bool valid_stream(const sample_stream_t<Sample> &stre
 }
 } // namespace
 
-status_t vqf_t::configure(const config_t &config)
+status_t vqf_eskf_t::configure(const config_t &config)
 {
     const float positive[] = {
         config.tau_acc, config.bias_sigma_init, config.bias_forgetting_time,
@@ -186,7 +186,7 @@ status_t vqf_t::configure(const config_t &config)
     return PYRO_OK;
 }
 
-status_t vqf_t::reset(const vector3_t &bias, float sigma)
+status_t vqf_eskf_t::reset(const vector3_t &bias, float sigma)
 {
     if (!_error_kf.is_initialized())
         return PYRO_NOT_FOUND;
@@ -216,7 +216,7 @@ status_t vqf_t::reset(const vector3_t &bias, float sigma)
     return PYRO_OK;
 }
 
-status_t vqf_t::update(const imu_data_t &data)
+status_t vqf_eskf_t::update(const imu_data_t &data)
 {
     err_stage = 0U;
     _state.consumed_gyr = 0;
@@ -309,7 +309,7 @@ status_t vqf_t::update(const imu_data_t &data)
 }
 
 /* 6×6 → 3×3 子块读/写（纯拷贝，无浮点运算）。 */
-void vqf_t::_get_block(const matrix_t<6, 6> &src, std::size_t row0, std::size_t col0,
+void vqf_eskf_t::_get_block(const matrix_t<6, 6> &src, std::size_t row0, std::size_t col0,
                        matrix_t<3, 3> &dst)
 {
     for (std::size_t row = 0; row < 3; ++row)
@@ -317,7 +317,7 @@ void vqf_t::_get_block(const matrix_t<6, 6> &src, std::size_t row0, std::size_t 
             dst(row, col) = src(row0 + row, col0 + col);
 }
 
-void vqf_t::_set_block(matrix_t<6, 6> &dst, std::size_t row0, std::size_t col0,
+void vqf_eskf_t::_set_block(matrix_t<6, 6> &dst, std::size_t row0, std::size_t col0,
                        const matrix_t<3, 3> &src)
 {
     for (std::size_t row = 0; row < 3; ++row)
@@ -326,7 +326,7 @@ void vqf_t::_set_block(matrix_t<6, 6> &dst, std::size_t row0, std::size_t col0,
 }
 
 /* 取当前 P 的四个 3×3 块。P 对称，因此 P10 = P01ᵀ（转置是纯拷贝，无舍入）。 */
-status_t vqf_t::_load_p_blocks()
+status_t vqf_eskf_t::_load_p_blocks()
 {
     const error_kf_t::covariance_t &P = _error_kf.get_covariance();
     _get_block(P, 0, 0, _p00);
@@ -345,7 +345,7 @@ status_t vqf_t::_load_p_blocks()
  *   r11 = P11,          r10 = X01ᵀ
  * MAC 数 81，通用 6×6 路径是 432（2 次乘法）＋一次 6×6 转置。
  * 结果与通用路径只差浮点分组，后续 predict_covariance 会对称化并加 Q。 */
-status_t vqf_t::_propagate_covariance()
+status_t vqf_eskf_t::_propagate_covariance()
 {
     if (_load_p_blocks() != PYRO_OK)
         return PYRO_ERROR;
@@ -375,7 +375,7 @@ status_t vqf_t::_propagate_covariance()
 /* G·P·Gᵀ，误差注入 G = [[J, 0], [0, I]]：
  *   (0,0) = J·P00·Jᵀ, (0,1) = J·P01, (1,0) = (J·P01)ᵀ, (1,1) = P11
  * 3 次 3×3 乘法（通用路径是 2 次 6×6 + 一次转置）。 */
-status_t vqf_t::_rotate_covariance()
+status_t vqf_eskf_t::_rotate_covariance()
 {
     if (_load_p_blocks() != PYRO_OK)
         return PYRO_ERROR;
@@ -411,7 +411,7 @@ status_t vqf_t::_rotate_covariance()
  * 每样本省下 2 次 sinf/cosf（M4F 上各约 20~30 周期）。
  * 半角公式在 |v|→0 时无精度问题（sin|v|→0、cos|v|→1），且小角分支
  * 仍走下面的泰勒展开，不参与此路径。 */
-status_t vqf_t::_compute_left_jacobian(const vector3_t &angle)
+status_t vqf_eskf_t::_compute_left_jacobian(const vector3_t &angle)
 {
     const float squared = square(angle[0]) + square(angle[1]) + square(angle[2]);
     float first = 0.5f - squared / 24.0f;
@@ -451,7 +451,7 @@ status_t vqf_t::_compute_left_jacobian(const vector3_t &angle)
     return PYRO_OK;
 }
 
-status_t vqf_t::_update_gyr(const vector3_t &gyr, float dt)
+status_t vqf_eskf_t::_update_gyr(const vector3_t &gyr, float dt)
 {
     const vector3_t unbiased = gyr - _state.bias;
     const vector3_t angle = unbiased * dt;
@@ -540,7 +540,7 @@ status_t vqf_t::_update_gyr(const vector3_t &gyr, float dt)
     return PYRO_OK;
 }
 
-void vqf_t::_reject_acc()
+void vqf_eskf_t::_reject_acc()
 {
     _state.acc_rejected = true;
     ++_state.acc_rejections;
@@ -551,7 +551,7 @@ void vqf_t::_reject_acc()
     _acc_lp.reset();
 }
 
-status_t vqf_t::_update_acc(const vector3_t &acc, float dt)
+status_t vqf_eskf_t::_update_acc(const vector3_t &acc, float dt)
 {
     const float magnitude = norm(acc);
     _state.acc_confidence = 0.0f;
@@ -648,7 +648,7 @@ status_t vqf_t::_update_acc(const vector3_t &acc, float dt)
     return PYRO_OK;
 }
 
-status_t vqf_t::_initialize_tilt()
+status_t vqf_eskf_t::_initialize_tilt()
 {
     const float magnitude = norm(_state.last_acc_lp);
     if (!matrix::is_finite(magnitude) || magnitude <= std::numeric_limits<float>::min())
@@ -674,7 +674,7 @@ status_t vqf_t::_initialize_tilt()
     return PYRO_OK;
 }
 
-status_t vqf_t::_correct_acc(float interval)
+status_t vqf_eskf_t::_correct_acc(float interval)
 {
     const float magnitude = norm(_state.last_acc_lp);
     if (!matrix::is_finite(magnitude) || magnitude <= std::numeric_limits<float>::min())
@@ -695,7 +695,7 @@ status_t vqf_t::_correct_acc(float interval)
     return result;
 }
 
-status_t vqf_t::_correct_rest(float interval)
+status_t vqf_eskf_t::_correct_rest(float interval)
 {
     error_kf_t::observation_t H;
     for (std::size_t i = 0; i < 3; ++i)
@@ -705,7 +705,7 @@ status_t vqf_t::_correct_rest(float interval)
     return _correct(_state.rest_gyr_lp - _state.bias, H, identity<3>(variance), false);
 }
 
-status_t vqf_t::_gate(error_kf_t::correction_t &correction, bool acceleration)
+status_t vqf_eskf_t::_gate(error_kf_t::correction_t &correction, bool acceleration)
 {
     if (acceleration && correction.diagnostics.nis > _config.acc_nis_threshold)
         return PYRO_WARNING;
@@ -744,7 +744,7 @@ status_t vqf_t::_gate(error_kf_t::correction_t &correction, bool acceleration)
     return PYRO_OK;
 }
 
-status_t vqf_t::_correct(const vector3_t &residual, const error_kf_t::observation_t &H,
+status_t vqf_eskf_t::_correct(const vector3_t &residual, const error_kf_t::observation_t &H,
                          const error_kf_t::measurement_noise_t &R, bool acceleration)
 {
     const auto prior = _error_kf.get_covariance();
@@ -771,7 +771,7 @@ status_t vqf_t::_correct(const vector3_t &residual, const error_kf_t::observatio
     return injected;
 }
 
-status_t vqf_t::_inject_error(const error_kf_t::state_t &delta)
+status_t vqf_eskf_t::_inject_error(const error_kf_t::state_t &delta)
 {
     const vector3_t angle{delta[0], delta[1], delta[2]};
     /* 与 _update_gyr 同样复用半角三角函数：rotation_step 输出、雅可比反推。
@@ -800,7 +800,7 @@ status_t vqf_t::_inject_error(const error_kf_t::state_t &delta)
     return PYRO_OK;
 }
 
-void vqf_t::get_state(state_t &result) const
+void vqf_eskf_t::get_state(state_t &result) const
 {
     result.quat = multiply(_state.acc_quat, _state.gyr_quat);
     result.bias = _state.bias;
@@ -832,7 +832,7 @@ void vqf_t::get_state(state_t &result) const
     result.bias_diagnostics = _diagnostics;
 }
 
-vqf_t::state_t vqf_t::get_state() const
+vqf_eskf_t::state_t vqf_eskf_t::get_state() const
 {
     state_t result;
     get_state(result);

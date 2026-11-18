@@ -14,7 +14,7 @@ Component/INS/pyro_ins.h/.cpp
        └─ 相同数值核心
 
 VQF + 误差状态滤波（本工程 IMU 产品使用）
-  └─ Algorithm/VQF/pyro_algo_vqf.h/.cpp    姿态传播、倾斜/静止观测、块结构传播
+  └─ Algorithm/VQF/pyro_algo_vqf_eskf.h/.cpp    姿态传播、倾斜/静止观测、块结构传播
        └─ Algorithm/KF/pyro_algo_eskf.h    eskf_t<N,Z>：误差状态注入适配
             └─ 相同数值核心
 ```

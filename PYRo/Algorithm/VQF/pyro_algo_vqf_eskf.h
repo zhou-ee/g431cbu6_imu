@@ -1,13 +1,29 @@
 // SPDX-FileCopyrightText: 2021 Daniel Laidig <laidig@control.tu-berlin.de>
 // SPDX-License-Identifier: MIT
 /**
- * @file pyro_algo_vqf.h
- * @brief 六轴 VQF 近惯性系预处理与全局姿态误差 ESKF。
- * VQF preprocessing with a global attitude-error / gyro-bias ESKF.
- * Adapted from VQF by Daniel Laidig and Thomas Seel.
+ * @file pyro_algo_vqf_eskf.h
+ * @brief 六轴 VQF 近惯性系预处理 + 全局姿态误差 ESKF。
+ *        Six-axis VQF preprocessing with a global attitude-error ESKF.
+ *
+ * ============================ 来源与命名 ============================
+ * 本实现源自 VQF（Versatile Quaternion-based Filter）：
+ *   论文 D. Laidig, T. Seel. "VQF: Highly Accurate IMU Orientation
+ *        Estimation with Bias Estimation and Magnetic Disturbance
+ *        Rejection." Information Fusion 2023, 91:187-204.
+ *   代码 https://github.com/dlaidig/vqf    MIT，全文见同目录 LICENSE
+ *
+ * 类名由 vqf_t 改为 vqf_eskf_t，以反映本实现的实际构成：
+ *   · 姿态传播沿用 VQF 的近惯性系双四元数分解（gyr_quat / acc_quat）
+ *     与加速度低通、静止检测；
+ *   · 误差状态估计用通用 ESKF（Algorithm/KF/pyro_algo_eskf.h）替代论文
+ *     中的启发式增益调度，协方差传播走 F=[[I,M],[0,I]] 的 3×3 块路径。
+ * 名字保留 vqf 前缀以标明算法来源，eskf 后缀标明实际的估计方法，
+ * 避免读者误认为这是纯 VQF 或纯 ESKF。
+ *
+ * 本文件对 VQF 部分继续遵循 MIT；本项目的改动部分由项目作者另行授权。
  */
-#ifndef PYRO_ALGO_VQF_H
-#define PYRO_ALGO_VQF_H
+#ifndef PYRO_ALGO_VQF_ESKF_H
+#define PYRO_ALGO_VQF_ESKF_H
 
 #include "pyro_algo_eskf.h"
 #include "pyro_algo_butterworth.h"
@@ -47,7 +63,7 @@ struct vqf_config_t
  * 角速度输入 rad/s，加速度输入 m/s²，输出 q 为传感器系到 Z-up 系的 [w,x,y,z]。
  * 陀螺积分、低通与协方差均使用样本的真实时间戳。
  */
-class vqf_t
+class vqf_eskf_t
 {
   public:
     using config_t = vqf_config_t;

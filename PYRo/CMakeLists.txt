@@ -47,7 +47,7 @@ target_sources(PYRo PRIVATE
         # CRC：UART 帧使用其中的 crc16_ccitt_false（产品协议）。
         # 链接自检（可选）：tests/pyro_algo_link_check.cpp
         Algorithm/Matrix/pyro_algo_matrix.cpp
-        Algorithm/VQF/pyro_algo_vqf.cpp
+        Algorithm/VQF/pyro_algo_vqf_eskf.cpp
         Algorithm/CRC/pyro_crc.cpp
 
         # --- IMU ---
@@ -103,11 +103,11 @@ target_link_libraries(PYRo PUBLIC stm32cubemx CMSISDSP)
 #   - 不必为了一个模块把整个 PYRo 提到 -O2。
 #
 # 注意：KF（pyro_algo_kf.h + .tpp）与 Butterworth 是纯头文件，其代码由
-# pyro_algo_vqf.cpp 实例化，所以给该文件加 -O2 即可覆盖到它们。
+# pyro_algo_vqf_eskf.cpp 实例化，所以给该文件加 -O2 即可覆盖到它们。
 # ------------------------------------------------------------------------------
 set(PYRO_ALGO_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/Algorithm/Matrix/pyro_algo_matrix.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Algorithm/VQF/pyro_algo_vqf.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/Algorithm/VQF/pyro_algo_vqf_eskf.cpp)
 
 set_source_files_properties(${PYRO_ALGO_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-O2")

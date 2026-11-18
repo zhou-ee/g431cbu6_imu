@@ -18,7 +18,7 @@
 #include <cstdint>
 
 #include "imu_base_drv.h"
-#include "pyro_algo_vqf.h"
+#include "pyro_algo_vqf_eskf.h"
 
 namespace imu_module
 {
@@ -125,9 +125,9 @@ inline imu_cfg_t driver_config()
  *  加速度静止波动约 0.2~0.3 m/s²，rest_th_acc 取 1.0 留余量。
  *  bias_clip 必须 ≥ rest_th_gyr，否则低通值被提前截断、静止永不成立。
  *  acc_update_period = 2 ms：倾斜/静止观测约 500 Hz，陀螺仍按全部样本传播。 */
-inline pyro::vqf_t::config_t vqf_config()
+inline pyro::vqf_eskf_t::config_t vqf_config()
 {
-    pyro::vqf_t::config_t cfg;
+    pyro::vqf_eskf_t::config_t cfg;
     cfg.tau_acc      = 0.4f;   /* s，加速度倾斜校正时间常数（默认 3.0 偏慢） */
     cfg.rest_min_t   = 1.0f;   /* s，静止确认时间 */
     cfg.rest_th_gyr  = 5.0f;   /* °/s */
@@ -157,7 +157,7 @@ inline pyro::vqf_t::config_t vqf_config()
      * 2026-11-17 关闭（true -> false），与 lsm6dsv_test/vqf_test.cpp 对齐——
      * 那个工程用 false，实测没有"静止后 yaw 突变"的问题。
      *
-     * 作用点：pyro_algo_vqf.cpp:_gate() 的
+     * 作用点：pyro_algo_vqf_eskf.cpp:_gate() 的
      *     if (!motion_bias_est_enabled || rest_detected) { 零偏行 K 清零 }
      * true 时运动中保留零偏行，倾斜观测可通过交叉协方差 P01 改 bias_z；
      * false 时零偏只由静止观测（_correct_rest）修改。

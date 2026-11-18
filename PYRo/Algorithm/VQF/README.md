@@ -1,6 +1,6 @@
 # 六轴 VQF
 
-`pyro::vqf_t` 将 VQF 近惯性系加速度低通与六维全局误差状态 EKF（ESKF）结合，提供陀螺积分、加速度可信度评估、倾斜校正、静止检测和三轴零偏估计。
+`pyro::vqf_eskf_t` 将 VQF 近惯性系加速度低通与六维全局误差状态 EKF（ESKF）结合，提供陀螺积分、加速度可信度评估、倾斜校正、静止检测和三轴零偏估计。
 这是本项目的定制融合实现，采用真实时间戳和固定存储。
 
 ## 公开接口
@@ -12,18 +12,18 @@
 | `update(data)` | 接收 `const imu_data_t &`，按时间戳合并处理两路新样本 |
 | `get_state()` | 取得姿态、联合误差协方差、零偏、消费帧数、观测可信度及 KF 诊断的值快照 |
 
-配置由 `vqf_t::config_t` 保存，包含六轴融合参数。更新间隔由输入时间戳决定。
-成员注释标明单位。结果由 `vqf_t::state_t` 保存，内部低通与积分状态由实例管理。
+配置由 `vqf_eskf_t::config_t` 保存，包含六轴融合参数。更新间隔由输入时间戳决定。
+成员注释标明单位。结果由 `vqf_eskf_t::state_t` 保存，内部低通与积分状态由实例管理。
 公开方法统一为上表四项。静止调试使用快照中的 `rest_t / rest_gyr_lp / rest_acc_lp`。
 
 ## 基本使用
 
 ```cpp
 #include "imu_base_drv.h"
-#include "pyro_algo_vqf.h"
+#include "pyro_algo_vqf_eskf.h"
 
-pyro::vqf_t attitude;
-pyro::vqf_t::config_t config;
+pyro::vqf_eskf_t attitude;
+pyro::vqf_eskf_t::config_t config;
 
 pyro::status_t attitude_init()
 {
@@ -215,7 +215,7 @@ python <备份目录>/PYRo_tests/run_vqf_eskf.py   # 测试已移出发布包，
 ```
 
 覆盖平移加速、振动、冲击、倒置初始化、真实三轴转动、静止/运动零偏、带噪声动态、异频流、环形批次、时间戳回绕、非法参数及数值失败回滚。
-可通过 `--baseline-dir` 指定保存旧版 `pyro_algo_vqf.h/.cpp` 的目录，运行相同的三项干扰回放作对比。
+可通过 `--baseline-dir` 指定保存旧版 `pyro_algo_vqf_eskf.h/.cpp` 的目录，运行相同的三项干扰回放作对比。
 合成回放使用已知四元数轨迹生成理想传感器输入，并叠加给定噪声及扰动。真实硬件误差、时间同步及 CPU 最坏耗时由上板验证补充。
 
 ## 模型参考

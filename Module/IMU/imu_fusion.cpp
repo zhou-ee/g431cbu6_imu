@@ -23,7 +23,7 @@
 #include "imu_capture.h"
 #include "imu_config.h"
 #include "imu_mount.h"
-#include "pyro_algo_vqf.h"
+#include "pyro_algo_vqf_eskf.h"
 #include "pyro_dwt_drv.h"
 #include "task.h"
 
@@ -67,7 +67,7 @@ namespace fusion
 namespace
 {
 
-pyro::vqf_t s_vqf;
+pyro::vqf_eskf_t s_vqf;
 
 /* 装配归一化参数：由 imu_mount.h 的正向表导出，初始化时算一次 */
 float s_m_inv[4] = {1.0f, 0.0f, 0.0f, 0.0f};
@@ -226,7 +226,7 @@ bool fuse_once()
             ++imu_service_vqf_err;    /* 参数非法，本批提前结束 */
         }
 
-        pyro::vqf_t::state_t state;
+        pyro::vqf_eskf_t::state_t state;
         s_vqf.get_state(state);
 
         /* 按算法实际消费量归还环形缓冲：
