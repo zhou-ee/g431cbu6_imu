@@ -271,12 +271,24 @@ CAN 节点号由 `kNodeId` 编译期配置（0~31，默认 1），
 
 ## 9. 版本与验证记录
 
+**当前版本：1.1.0**（定义于 `Module/Application/imu_module.h` 的 `IMU_MODULE_VERSION_*`）
+
+| 版本 | 变更 |
+|---|---|
+| 1.0.0 | 首个正式版：双任务 + SPSC + 信号量驱动发布 |
+| 1.0.1 | VQF 静止态耗时优化（Joseph 块化 / 检查精简 / trig 复用） |
+| **1.1.0** | ESKF 抽为 `PYRo/Algorithm/KF` 下的独立组件，与 `ekf_t`、`lkf_t` 并列 |
+
 | 项 | 内容 |
 |---|---|
-| 当前构建 | Release Flash 71.6 KB / RAM 25.1 KB |
-| 真机验证 | 采集 1000.0 Hz、融合 999.4 Hz、发布同步 999.4 Hz |
+| 当前构建 | Release Flash 72.1 KB / RAM 25.1 KB |
+| 真机验证 | 采集 1000.0 Hz、融合 1000.0 Hz |
 | 稳态错误 | `err_bus` / `err_timeout` / `err_ovr` / `err_backpressure` 全 0 |
+| 算法耗时 | `update()` 平均 498 µs / 峰值 760 µs |
 | 主机回归 | VQF/ESKF 数值回归、SPSC 并发回归全部通过 |
+
+> `err_overrun` 在接调试器（DAPLink halt）测量时会出现个位数增长，
+> 因为停机期间器件 FIFO 积压触发整批丢弃；不接调试器时应为 0。
 
 协议规格详见 [PROTOCOL.md](Module/PROTOCOL.md)，
 代码结构详见 [STRUCTURE.md](STRUCTURE.md)。

@@ -749,7 +749,11 @@ status_t vqf_t::_correct(const vector3_t &residual, const error_kf_t::observatio
 {
     const auto prior = _error_kf.get_covariance();
     error_kf_t::measurement_mask_t mask{true, true, !acceleration};
-    const status_t result = _error_kf.correct(residual, H, R, &mask,
+    /* eskf_t::correct 与 kf_t::correct 的唯一区别是多一个 dx 出参：把本次
+     * 实际施加的误差增量交给 _inject_error()。协方差仍由核心按最终 K 更新，
+     * 因此「更新协方差用的增量」与「注入名义状态的增量」是同一份。 */
+    error_kf_t::state_t delta{};
+    const status_t result = _error_kf.correct(residual, H, R, delta, &mask,
         [this, acceleration](error_kf_t::correction_t &correction)
         { return _gate(correction, acceleration); });
     _diagnostics = _error_kf.get_diagnostics();
@@ -757,7 +761,7 @@ status_t vqf_t::_correct(const vector3_t &residual, const error_kf_t::observatio
         _state.acc_nis = _diagnostics.nis;
     if (result != PYRO_OK)
         return result;
-    const status_t injected = _inject_error();
+    const status_t injected = _inject_error(delta);
     if (injected != PYRO_OK)
     {
         // 注入失败时恢复修正前协方差，名义姿态和零偏仍保持原值。
@@ -767,9 +771,8 @@ status_t vqf_t::_correct(const vector3_t &residual, const error_kf_t::observatio
     return injected;
 }
 
-status_t vqf_t::_inject_error()
+status_t vqf_t::_inject_error(const error_kf_t::state_t &delta)
 {
-    const auto &delta = _error_kf.get_state();
     const vector3_t angle{delta[0], delta[1], delta[2]};
     /* 与 _update_gyr 同样复用半角三角函数：rotation_step 输出、雅可比反推。
      * 这里必须显式置 _trig_valid，否则会沿用上一次 _update_gyr 的残值，

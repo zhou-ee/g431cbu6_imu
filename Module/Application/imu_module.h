@@ -16,6 +16,24 @@
 
 #include <stdint.h>
 
+/* ============================ 固件版本 ============================
+ * 语义化版本：主.次.修订
+ *   主 —— 对外协议或行为不兼容变更
+ *   次 —— 向后兼容的功能新增（本版：ESKF 拆分为独立 KF 组件）
+ *   修订 —— 向后兼容的问题修正或性能优化
+ *
+ * 修订历史：
+ *   1.0.0  首个正式版：双任务 + SPSC + 信号量驱动发布
+ *   1.0.1  VQF 静止态耗时优化（Joseph 块化 / 检查精简 / trig 复用）
+ *   1.1.0  ESKF 抽为 PYRo/Algorithm/KF 下的独立组件，与 ekf/lkf 并列
+ *
+ * 版本号不参与线上协议（PROTOCOL.md 明确本版消息不含版本字段），
+ * 仅用于固件标识与问题追溯。 */
+#define IMU_MODULE_VERSION_MAJOR 1
+#define IMU_MODULE_VERSION_MINOR 1
+#define IMU_MODULE_VERSION_PATCH 0
+#define IMU_MODULE_VERSION_STRING "1.1.0"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

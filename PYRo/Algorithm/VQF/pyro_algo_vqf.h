@@ -9,7 +9,7 @@
 #ifndef PYRO_ALGO_VQF_H
 #define PYRO_ALGO_VQF_H
 
-#include "pyro_algo_kf.h"
+#include "pyro_algo_eskf.h"
 #include "pyro_algo_butterworth.h"
 
 struct imu_data_t;
@@ -100,7 +100,7 @@ class vqf_t
     inline static volatile uint32_t err_stage = 0U;
 
   private:
-    using error_kf_t = kf_t<6, 3, true>;
+    using error_kf_t = eskf_t<6, 3, true>;
     struct sample_clock_t
     {
         uint32_t timestamp = 0;
@@ -140,7 +140,7 @@ class vqf_t
     status_t _initialize_tilt();
     status_t _correct_acc(float interval);
     status_t _correct_rest(float interval);
-    status_t _inject_error();
+    status_t _inject_error(const error_kf_t::state_t &delta);
     status_t _gate(error_kf_t::correction_t &correction, bool acceleration);
     status_t _correct(const vector3_t &residual, const error_kf_t::observation_t &H,
                       const error_kf_t::measurement_noise_t &R, bool acceleration);

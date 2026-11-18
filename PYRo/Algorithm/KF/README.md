@@ -1,4 +1,4 @@
-# 通用 KF 与独立 EKF
+# 通用 KF 与独立 EKF / LKF / ESKF
 
 依赖方向从应用指向算法，四元数模型属于 INS：
 
@@ -12,7 +12,24 @@ Component/INS/pyro_ins.h/.cpp
 任意线性应用
   └─ Algorithm/KF/pyro_algo_lkf.h   可选线性适配器
        └─ 相同数值核心
+
+VQF + 误差状态滤波（本工程 IMU 产品使用）
+  └─ Algorithm/VQF/pyro_algo_vqf.h/.cpp    姿态传播、倾斜/静止观测、块结构传播
+       └─ Algorithm/KF/pyro_algo_eskf.h    eskf_t<N,Z>：误差状态注入适配
+            └─ 相同数值核心
 ```
+
+三个适配器的分工：
+
+| 类 | 文件 | 相对核心新增 |
+|---|---|---|
+| `ekf_t<N,Z>` | `pyro_algo_ekf.h` | `correct(z, z_pred, H, R, …)`：先算残差 z−h(x) 再交给核心 |
+| `lkf_t<N,Z,U>` | `pyro_algo_lkf.h` | `predict(F, Q)` / `predict(F, Q, B, u)` 与 `correct(z, H, R, …)` |
+| `eskf_t<N,Z>` | `pyro_algo_eskf.h` | `correct(y, H, R, dx, …)` 多回传误差增量；`reset_after_inject(P)` |
+
+`eskf_t` 与 `ekf_t` 的唯一区别是 `correct` 多一个 `dx` 出参：误差状态滤波要求把
+δθ/δb 注入回名义状态，而协方差仍由核心按最终 K 更新，二者必须用同一份增量。
+`reset_after_inject` 对应注入后的协方差替换（G·P·Gᵀ）。
 
 核心仅提供 `init/reset/predict/correct` 四种操作及只读查询；没有 `*_from_model`、
 外部 prepare/apply/reject，也不读取传感器或时钟。状态和矩阵使用固定尺寸的
