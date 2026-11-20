@@ -73,8 +73,10 @@ public:
 
 class lsm6dsv16x_spi_t : public lsm6dsv16x_t {
 public:
-    /* dma_enable 控制 FIFO 是否采用 DMA 流水，普通寄存器读写同步完成。 */
-    lsm6dsv16x_spi_t(SPI_HandleTypeDef *spi_handle, GPIO_TypeDef *cs_port, uint16_t cs_pin, bool dma_enable);
+    /* bus 是该 SPI 总线的唯一驱动实例（由 bsp_spi 持有）：同一总线上挂多颗
+     * 器件时，各自传同一个 bus 引用，仅 CS 引脚不同。
+     * dma_enable 控制 FIFO 是否采用 DMA 流水，普通寄存器读写同步完成。 */
+    lsm6dsv16x_spi_t(pyro::spi_drv_t &bus, GPIO_TypeDef *cs_port, uint16_t cs_pin, bool dma_enable);
 
     bool read_regs(uint8_t reg, uint8_t *buf, uint16_t len) override;
     bool write_regs(uint8_t reg, uint8_t *buf, uint16_t len) override;
@@ -84,7 +86,10 @@ public:
     bool read_regs_collect(uint8_t *buf, uint16_t len) override;
     bool wait_dma(uint32_t timeout_ms) override;
 private:
-    SPI_HandleTypeDef *_spi_handle;
+    /* 总线驱动引用（不持有）：由 bsp_spi 管理生命周期，同一总线多从机共享。
+     * 设备层只通过它访问总线，不再保存 SPI_HandleTypeDef 副本。 */
+    pyro::spi_drv_t &_spi_drv;
+
     GPIO_TypeDef *_cs_port;
     uint16_t _cs_pin;
 
@@ -110,11 +115,6 @@ private:
     /* 在途异步小读的数据长度（不含地址字节），0 表示没有在途小读。 */
     uint16_t _sm_len{};
 
-    /* SPI 收发引擎（PYRo/Peripheral/SPI，仿 UART 驱动：阻塞 + DMA 双 API）：
-     * 小读/写走 txrx/tx（阻塞），大读走 txrx_dma（发起即返回）。
-     * HAL 完成/错误回调经 spi_map() 句柄表路由到本对象。 */
-    pyro::spi_drv_t _spi_drv;
-
     /* 大读的收发暂存（随对象静态生命周期，不进调用者栈，支撑 FIFO 大批量读）。
      * 维度是 [槽][字节]：外层 2 个槽，内层每槽 LSM6DSV16X_MAX_BURST+1 字节，
      * 两槽在内存里彼此独立、互不重叠——这是"一笔 DMA 在途时另一槽可安全交付
@@ -131,9 +131,13 @@ private:
 
     void cs_high() const;
 
+    /* 发起一笔 DMA 事务：每笔事务前绑定完成钩子（单槽，多从机共享）→
+     * 拉低 CS → 发起。调用方须已确认总线可用。 */
+    pyro::status_t dma_start(const uint8_t *tx, uint8_t *rx, uint16_t size);
+
     /* DMA 完成钩子（ISR 上下文）：在数据搬运完成点释放 CS，
      * 而非等任务唤醒——CS 低电平尾部最短，且时序不依赖阻塞等待前提。
-     * 经 spi_drv_t::set_cplt_hook 注册，完成/错误时都会调用。 */
+     * 每笔事务发起前经 spi_drv_t::set_cplt_hook 绑定到本对象。 */
     static void release_cs_from_isr(void *ctx);
 };
 

@@ -21,8 +21,8 @@ bool lsm6dsv16x_spi_t::read_regs_request(const uint8_t reg, const uint16_t len) 
         _sm_tx[i] = 0x00U;
     }
 
-    cs_low();
-    if (_spi_drv.txrx_dma(_sm_tx, _sm_rx, static_cast<uint16_t>(len + 1U)) != pyro::PYRO_OK) {
+    /* dma_start 内部负责：绑定完成钩子 → 拉低 CS → 发起 */
+    if (dma_start(_sm_tx, _sm_rx, static_cast<uint16_t>(len + 1U)) != pyro::PYRO_OK) {
         cs_high(); /* 未成立的事务：任务侧释放 CS（DMA 路径无完成回调） */
         return false;
     }
@@ -145,8 +145,7 @@ bool lsm6dsv16x_spi_t::read_fifo(uint8_t *buf, const uint16_t capacity,
     for (uint16_t i = 1U; i <= request_len; ++i) {
         tx[i] = 0x00U;
     }
-    cs_low();
-    if (_spi_drv.txrx_dma(tx, rx, static_cast<uint16_t>(request_len + 1U)) != pyro::PYRO_OK) {
+    if (dma_start(tx, rx, static_cast<uint16_t>(request_len + 1U)) != pyro::PYRO_OK) {
         cs_high();
         return false; // received_len 仍报告本次已经交付的完整帧。
     }
@@ -179,15 +178,22 @@ bool lsm6dsv16x_spi_t::write_regs(const uint8_t reg, uint8_t *buf, const uint16_
     return ok;
 }
 
-lsm6dsv16x_spi_t::lsm6dsv16x_spi_t(SPI_HandleTypeDef *spi_handle, GPIO_TypeDef *cs_port, uint16_t cs_pin,
+lsm6dsv16x_spi_t::lsm6dsv16x_spi_t(pyro::spi_drv_t &bus, GPIO_TypeDef *cs_port, uint16_t cs_pin,
                                      const bool dma_enable)
-    : _dma_enable(dma_enable), _spi_drv(spi_handle) {
-    _spi_handle = spi_handle;
-    _cs_port = cs_port;
-    _cs_pin = cs_pin;
-    /* DMA 路径：CS 在完成回调（ISR）中释放，不等任务唤醒。
-     * 阻塞路径无完成回调，钩子不会被调用，CS 由任务侧释放。 */
+    : _spi_drv(bus), _cs_port(cs_port), _cs_pin(cs_pin), _dma_enable(dma_enable) {
+    /* 这里【不】注册完成钩子：钩子在总线驱动上是单槽的，同一总线可能挂多颗
+     * 器件，构造期注册会被后构造者覆盖。改由 dma_start() 在每笔事务发起前
+     * 绑定到自身（见下），这才是钩子应有的生命周期粒度。 */
+}
+
+/* 发起一笔 DMA 事务：绑定完成钩子 → 拉低 CS → 发起。
+ * 顺序不可换：
+ *   - 钩子必须在 txrx_dma 之前设好，因为完成中断可能在 HAL 返回前就触发；
+ *   - CS 必须在 txrx_dma 之前拉低，否则地址字节会被别的从机"听"走。 */
+pyro::status_t lsm6dsv16x_spi_t::dma_start(const uint8_t *tx, uint8_t *rx, const uint16_t size) {
     _spi_drv.set_cplt_hook(&lsm6dsv16x_spi_t::release_cs_from_isr, this);
+    cs_low();
+    return _spi_drv.txrx_dma(tx, rx, size);
 }
 
 /* DMA 完成/错误时由 spi_drv_t 在 ISR 上下文调用：数据已完整（BSY=0），

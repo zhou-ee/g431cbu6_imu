@@ -46,6 +46,10 @@ namespace pyro
  */
 class spi_drv_t
 {
+    /* 实例化权收归 BSP：一个 HAL 外设句柄 = 一条总线 = 一个驱动实例。
+     * 外部统一通过 bsp_spi::get_spiX() 取得引用。 */
+    friend class bsp_spi;
+
   public:
     /* Public Types ---------------------------------------------------------*/
     /**
@@ -60,16 +64,6 @@ class spi_drv_t
     } state_t;
 
     /* Constructor and Destructor -------------------------------------------*/
-    /**
-     * @brief Constructor.
-     * 构造函数。
-     *
-     * @param hspi Pointer to the HAL SPI handle.
-     * HAL SPI 句柄指针。
-     * @note 每个 HAL 句柄只应构造一个实例（ISR 路由正确性，见文件头说明）。
-     */
-    explicit spi_drv_t(SPI_HandleTypeDef *hspi);
-
     /**
      * @brief Destructor.
      * 析构函数。
@@ -229,6 +223,14 @@ class spi_drv_t
 
   private:
     /* Private Methods ------------------------------------------------------*/
+    /**
+     * @brief Constructor（私有，仅友元 bsp_spi 可调用）。
+     * 构造函数（私有，由 BSP 创建以保证「一总线一实例」）。
+     *
+     * @param hspi Pointer to the HAL SPI handle.
+     * HAL SPI 句柄指针。
+     */
+    explicit spi_drv_t(SPI_HandleTypeDef *hspi);
 
     /* Private Members ------------------------------------------------------*/
     SPI_HandleTypeDef *_hspi;      /* HAL handle for the peripheral. 外设 HAL 句柄 */

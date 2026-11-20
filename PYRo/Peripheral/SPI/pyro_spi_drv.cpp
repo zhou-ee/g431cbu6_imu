@@ -32,12 +32,15 @@ spi_drv_t::spi_drv_t(SPI_HandleTypeDef *hspi) : _hspi(hspi), _err(HAL_SPI_ERROR_
         return; /* 不注册到 spi_map()：该实例不可用，调用方拿到 PYRO_ERROR */
     }
 
-    /* 同句柄只注册首个实例：防止后建实例在 ISR 路由表中劫持完成信号。
-     * 约定每个 HAL 句柄全局只有一个 spi_drv_t（bsp_spi::get_spi1() 为复用式访问）。 */
-    if (!spi_map().exist(hspi))
-    {
-        spi_map()[hspi] = this;
-    }
+    /* 无条件注册：构造函数已私有，外部只能经 bsp_spi 拿到唯一实例，
+     * 因此这里不存在「同句柄重复注册」的可能。
+     *
+     * 原实现是「if (!spi_map().exist(hspi)) 才注册」，那会把重复构造的
+     * 编程错误静默吞掉（第二个实例照常构造成功、却永远收不到完成通知）。
+     * 更糟的是它在多从机场景下必然触发——多个设备共用同一句柄时，
+     * 第二个实例会被无声丢弃。此后重复构造由「构造函数私有」在编译期拦住，
+     * 这里不需要再做运行时防重。 */
+    spi_map()[hspi] = this;
 }
 
 spi_drv_t::~spi_drv_t()

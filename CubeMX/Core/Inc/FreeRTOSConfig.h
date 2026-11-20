@@ -68,8 +68,17 @@
  *   defaultTask 1024 词 + imu 任务 1024 词 + IDLE 128 词
  *   + 3 个 TCB + 若干锁 ≈ 9.2 KB，取 12 KB 留余量。
  * （早期给 8192 B 时堆已接近上限；defaultTask 承担 imu 初始化调用链，
- *   曾因栈溢出踩坏堆块导致 HardFault，故两个任务栈都给 1024 词。） */
-#define configTOTAL_HEAP_SIZE                    ((size_t)12288)
+ *   曾因栈溢出踩坏堆块导致 HardFault，故两个任务栈都给 1024 词。）
+ *
+ * 2026-11-20 上调 12288 → 16384（+4 KB）：
+ *   总线驱动 spi_drv_t 与器件对象 lsm6dsv16x_spi_t(1056 B) /
+ *   lsm6dsv16x_drv_t(2412 B) 改为在 capture::init() 中动态创建
+ *   （不再作为 .bss 静态对象，以避开「静态构造早于 MX_SPI1_Init」的
+ *   初始化顺序问题），这部分共 3468 B 改由本堆承担。若沿用 12 KB，
+ *   init 后堆只剩约 3.3 KB，而两个采集/融合任务的栈共需 4 KB，
+ *   xTaskCreate 会失败并返回 PYRO_NO_MEMORY（实测已复现）。
+ *   上调后 RAM 总占用仍低于 32 KB 预算。 */
+#define configTOTAL_HEAP_SIZE                    ((size_t)16384)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_16_BIT_TICKS                   0
 #define configUSE_MUTEXES                        1
