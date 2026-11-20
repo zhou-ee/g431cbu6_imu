@@ -12,7 +12,13 @@ lsm6dsv16x_t::~lsm6dsv16x_t() = default;
 
 /* ===================== 总线锁（幂等封装） =====================
  * 同一把总线锁会在「发起 → wait_dma → collect」之间跨函数保持，
- * 收尾点分散在多个函数里。统一走这两个函数，重复 acquire/release 安全。 */
+ * 收尾点分散在多个函数里。统一走这两个函数，重复 acquire/release 安全。
+ *
+ * 【完成钩子的绑定规则：与总线所有权严格对齐】
+ *   绑定：必须在 acquire_bus 成功之后（下面的 bus_acquire 里做）
+ *   解绑：必须在 release_bus 之前  （下面的 bus_release 里做）
+ * 这样保证：钩子在持有期间不可能被别人覆盖；总线交出去时钩子已清空，
+ * 后续即使出现迟到的完成中断，ISR 也不会误调上一个设备的 CS 释放函数。 */
 
 pyro::status_t lsm6dsv16x_spi_t::bus_acquire(const uint32_t timeout_ms) {
     if (_holding_bus) {
@@ -24,6 +30,9 @@ pyro::status_t lsm6dsv16x_spi_t::bus_acquire(const uint32_t timeout_ms) {
         return pyro::PYRO_BUSY;
     }
     _holding_bus = true;
+
+    /* 【绑定】此刻已独占总线，绑定不会被任何其他设备看到或覆盖。 */
+    _spi_drv.set_cplt_hook(&lsm6dsv16x_spi_t::release_cs_from_isr, this);
     return pyro::PYRO_OK;
 }
 
@@ -31,6 +40,12 @@ void lsm6dsv16x_spi_t::bus_release() {
     if (!_holding_bus) {
         return; /* 未持有：no-op，避免重复 give */
     }
+
+    /* 【解绑】在放锁之前清空，保证总线交出去时钩子是干净的。
+     * 这一步同时覆盖了"发起失败"和"正常结束"两条路径：
+     * 凡是走到 bus_release() 的地方，钩子一定被清掉了。 */
+    _spi_drv.set_cplt_hook(nullptr, nullptr);
+
     _holding_bus = false;
     (void)_spi_drv.release_bus();
 }
@@ -235,17 +250,18 @@ bool lsm6dsv16x_spi_t::write_regs(const uint8_t reg, uint8_t *buf, const uint16_
 lsm6dsv16x_spi_t::lsm6dsv16x_spi_t(pyro::spi_drv_t &bus, GPIO_TypeDef *cs_port, uint16_t cs_pin,
                                      const bool dma_enable)
     : _spi_drv(bus), _cs_port(cs_port), _cs_pin(cs_pin), _dma_enable(dma_enable) {
-    /* 这里【不】注册完成钩子：钩子在总线驱动上是单槽的，同一总线可能挂多颗
-     * 器件，构造期注册会被后构造者覆盖。改由 dma_start() 在每笔事务发起前
-     * 绑定到自身（见下），这才是钩子应有的生命周期粒度。 */
+    /* 构造期【不】注册完成钩子：钩子只在持有总线期间有效，
+     * 由 bus_acquire()/bus_release() 成对管理（见文件头）。
+     * 构造期注册既无意义（此时不持锁），又会与多从机互相覆盖。 */
 }
 
-/* 发起一笔 DMA 事务：绑定完成钩子 → 拉低 CS → 发起。
- * 顺序不可换：
- *   - 钩子必须在 txrx_dma 之前设好，因为完成中断可能在 HAL 返回前就触发；
- *   - CS 必须在 txrx_dma 之前拉低，否则地址字节会被别的从机"听"走。 */
+/* 发起一笔 DMA 事务：拉低 CS → 发起。
+ * 调用方必须已经通过 bus_acquire() 取得总线——完成钩子已在那一步
+ * 绑定为本对象，此处不需要也不应该再绑（否则会绕过"绑定在锁内"的约定）。
+ *
+ * 顺序不可换：CS 必须在 txrx_dma 之前拉低，否则地址字节会被
+ * 别的从机"听"走。 */
 pyro::status_t lsm6dsv16x_spi_t::dma_start(const uint8_t *tx, uint8_t *rx, const uint16_t size) {
-    _spi_drv.set_cplt_hook(&lsm6dsv16x_spi_t::release_cs_from_isr, this);
     cs_low();
     return _spi_drv.txrx_dma(tx, rx, size);
 }

@@ -319,6 +319,9 @@ status_t spi_drv_t::abort()
 
 void spi_drv_t::set_cplt_hook(void (*hook)(void *), void *ctx)
 {
+    /* 绑定/解绑都必须发生在总线所有权窗口内（acquire_bus 之后、
+     * release_bus 之前），详见头文件注释。
+     * 解绑时传 (nullptr, nullptr)，两条字写入，无分支。 */
     _cplt_hook = hook;
     _cplt_ctx  = ctx;
 }
