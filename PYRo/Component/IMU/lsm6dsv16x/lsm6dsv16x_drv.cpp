@@ -197,7 +197,6 @@ bool lsm6dsv16x_drv_t::read_direct() {
     uint8_t ts[4]{};
     if (!_device.read_regs(TIMESTAMP0, ts, sizeof(ts))) {
         ++_fifo.err_bus;
-        ++_fifo.discontinuities;
         return false;
     }
     _fifo.pend_ts = load_u32le(ts);
@@ -281,7 +280,6 @@ bool lsm6dsv16x_drv_t::read_fifo_batch() {
     if (ovr_now && !_fifo.ovr_prev) {
         ++_fifo.err_data; /* continuous 模式满后覆盖最旧：已丢样本 */
         ++_fifo.err_ovr;  /* 器件侧溢出，与软件背压分开计数 */
-        ++_fifo.discontinuities;
         _fifo.timestamp_valid = false;
     }
     _fifo.ovr_prev = ovr_now;
@@ -306,7 +304,6 @@ bool lsm6dsv16x_drv_t::read_fifo_batch() {
     if (cap != 0U && diff > cap) {
         ++_fifo.err_data;
         ++_fifo.err_overrun;
-        ++_fifo.discontinuities;
         _fifo.timestamp_valid = false;
 
         uint16_t drain_words = diff;
@@ -345,14 +342,12 @@ bool lsm6dsv16x_drv_t::read_fifo_batch() {
     }
     if (!_device.wait_dma(LSM6DSV16X_CPLT_TIMEOUT_MS)) {
         ++_fifo.err_timeout;
-        ++_fifo.discontinuities;
         _fifo.timestamp_valid = false;
         return false;
     }
     /* request_len=0：只取回已完成的那一帧，不再发起新请求 */
     if (!_device.read_fifo(_fifo_raw, sizeof(_fifo_raw), 0U, received_len)) {
         ++_fifo.err_bus;
-        ++_fifo.discontinuities;
         _fifo.timestamp_valid = false;
         return false;
     }

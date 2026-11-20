@@ -26,13 +26,15 @@
  *   1.0.0  首个正式版：双任务 + SPSC + 信号量驱动发布
  *   1.0.1  VQF 静止态耗时优化（Joseph 块化 / 检查精简 / trig 复用）
  *   1.1.0  ESKF 抽为 PYRo/Algorithm/KF 下的独立组件，与 ekf/lkf 并列
+ *   1.2.0  发布层与器件解耦：编码系数改由协议层按模块量程自行定义，
+ *          角速度发送算法扣零偏后的最终值，移除 diag 与丢样代次校验
  *
  * 版本号不参与线上协议（PROTOCOL.md 明确本版消息不含版本字段），
  * 仅用于固件标识与问题追溯。 */
 #define IMU_MODULE_VERSION_MAJOR 1
-#define IMU_MODULE_VERSION_MINOR 1
+#define IMU_MODULE_VERSION_MINOR 2
 #define IMU_MODULE_VERSION_PATCH 0
-#define IMU_MODULE_VERSION_STRING "1.1.0"
+#define IMU_MODULE_VERSION_STRING "1.2.0"
 
 #ifdef __cplusplus
 extern "C" {

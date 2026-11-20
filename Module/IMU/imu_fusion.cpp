@@ -112,15 +112,20 @@ struct latest_sample_t
 
 latest_sample_t<acc_sample_t> s_acc;
 latest_sample_t<gyro_sample_t> s_gyro;
-uint32_t s_discontinuities = 0U;
 
+/* 重置原因码。显式赋值而不依赖枚举自增：调试器里看 imu_service_reset_reason
+ * 需要能直接对照到原因，且后续增删原因时不应让既有取值漂移。
+ *
+ * 原有一项 capture_loss（软件层丢样代次变化）已移除：出现样本流断裂必然意味着
+ * 别处代码有误或硬件故障，前者应在调试阶段解决、后者运行期无法修复；
+ * 而且每丢一两个样本就重置滤波器，代价（valid=false 期间不输出、航向零点
+ * 重建）远大于收益。真正的长时间断裂由 VQF 自身的 max_sample_gap_s 捕获。 */
 enum class reset_reason_t : uint32_t
 {
-    capture_loss = 1U,
-    stale,
-    rollback,
-    gap,
-    filter_error
+    stale        = 1U,   /* 超过 max_sample_gap_s 没有新样本（生产端停了） */
+    rollback     = 2U,   /* 时间戳倒退，该帧已隔离 */
+    gap          = 3U,   /* 时间戳跨度过大（VQF err_stage=6） */
+    filter_error = 4U    /* 其他滤波器错误 */
 };
 
 uint32_t s_sequence = 0U;
@@ -202,12 +207,8 @@ pyro::status_t init()
      * 保证通信层的反向换算与驱动正向换算同源。 */
     mount_inverse_indices(k_imu_direct, s_publish_params.inv_idx,
                           s_publish_params.inv_neg);
-    s_publish_params.acc_mps2_per_lsb = capture::acc_mps2_per_lsb();
-    s_publish_params.gyro_rps_per_lsb = capture::gyro_rps_per_lsb();
-    const imu_cali_t &c = capture::cali();
-    s_publish_params.gyro_bias_dev[0] = c.gx_offset;
-    s_publish_params.gyro_bias_dev[1] = c.gy_offset;
-    s_publish_params.gyro_bias_dev[2] = c.gz_offset;
+    /* 编码系数由协议层按模块量程自行定义（协议自包含），
+     * 这里只导出装配方向表——它是产品几何属性，与器件无关。 */
 
     const pyro::status_t cfg = s_vqf.configure(config::vqf_config());
     imu_service_vqf_ready = (cfg == pyro::PYRO_OK) ? 1 : 0;
@@ -218,7 +219,6 @@ pyro::status_t init()
 
     s_algo_next_1s = static_cast<uint32_t>(xTaskGetTickCount()) + 1000U;
     s_heading_started = xTaskGetTickCount();
-    s_discontinuities = capture::discontinuities();
     return pyro::PYRO_OK;
 }
 
@@ -258,7 +258,13 @@ void publish_snapshot(const pyro::vqf_eskf_t::state_t &state)
     const float *last_acc  = s_acc.sample.Accel;
     const float *last_gyro = s_gyro.sample.Gyro;
     float acc_inst[3]  = {last_acc[0], last_acc[1], last_acc[2]};
-    float gyro_inst[3] = {last_gyro[0], last_gyro[1], last_gyro[2]};
+    /* 角速度先扣掉 VQF 在线估计的零偏，再换到安装系对外发布。
+     * 顺序不能反：_state.bias 与 last_gyro 同为机体系，必须先在同一坐标系里
+     * 相减，再一起旋转；若先换系，零偏就落在了错误的坐标系上。
+     * 这样对外发出的是"算法处理后的最终角速度"，接收端无需再做零偏补偿。 */
+    float gyro_inst[3] = {last_gyro[0] - state.bias[0],
+                          last_gyro[1] - state.bias[1],
+                          last_gyro[2] - state.bias[2]};
     float bias_inst[3] = {state.bias[0], state.bias[1], state.bias[2]};
     mount_apply(acc_inst, k_imu_direct);
     mount_apply(gyro_inst, k_imu_direct);
@@ -346,33 +352,32 @@ void publish_snapshot(const pyro::vqf_eskf_t::state_t &state)
 bool process_batch()
 {
     imu_data_t batch{};
-    uint32_t discontinuities;
     // 固定两路 tail 和丢失代次。释放 head 前生产者不能覆盖本批的槽。
     vTaskSuspendAll();
     const imu_data_t &live = capture::data();
     batch.gyro = live.gyro;
     batch.acc = live.acc;
     batch.timestamp_tick_s = live.timestamp_tick_s;
-    discontinuities = capture::discontinuities();
     (void)xTaskResumeAll();
 
     const uint16_t gyro_count = batch.gyro.available();
     const uint16_t acc_count = batch.acc.available();
     const TickType_t now = xTaskGetTickCount();
-    const bool loss = discontinuities != s_discontinuities;
-    s_discontinuities = discontinuities;
     const bool stale = s_gyro.expired(now) || s_acc.expired(now);
-    if (!loss && !stale && (gyro_count == 0U && acc_count == 0U))
+    if (!stale && (gyro_count == 0U && acc_count == 0U))
     {
         return false;
     }
 
     pyro::vqf_eskf_t::state_t state;
-    if (loss || stale)
+    if (stale)
     {
+        /* 只在"根本没有新样本"时重置。样本流中途丢几个不重置：
+         * VQF 按时间戳 dt 积分，丢样只表现为 dt 略大；真正的长时间断裂
+         * 由它自己的 max_sample_gap_s 检测（err_stage=6）兜住。 */
         capture::release_consumed(gyro_count, acc_count);
         s_vqf.get_state(state);
-        reset_fusion(state, loss ? reset_reason_t::capture_loss : reset_reason_t::stale);
+        reset_fusion(state, reset_reason_t::stale);
     }
     else if (imu_service_vqf_ready)
     {

@@ -35,6 +35,28 @@ constexpr uint32_t    kCanIdStep     = 0x10U;
 constexpr uint8_t     kNodeIdMax     = 31U;
 constexpr float       kQuatScale     = 32767.0f;
 
+/* ============================ 模块量程（协议自定） ============================
+ * 这是【本模块对外的编码约定】，不是器件参数：
+ *   满码 ±32768  ⇔  ±kModuleAccRangeG / ±kModuleGyroRangeDps
+ * 收发两端按同一组常量换算，协议因此自包含——不 include 产品配置、
+ * 也不依赖器件实际灵敏度。
+ *
+ * 注意：器件陀螺真实灵敏度是 0.070 dps/LSB（满码约 ±2294 dps），
+ * 而本约定是 2000/32768 = 0.0610 dps/LSB，满码恰好对应 ±2000 dps。
+ * 即模块标称量程用满整个 int16，器件侧 14.7% 的余量不对外暴露，
+ * 超过 ±2000 dps 的真实角速度会被削顶——这是标称量程的预期行为。
+ *
+ * 换量程时只改这里两行，与 imu_config.h 的器件量程各自独立维护。 */
+constexpr uint16_t kModuleAccRangeG    = 4U;      /* ±g */
+constexpr uint16_t kModuleGyroRangeDps = 2000U;   /* ±°/s */
+
+/* 编码系数由上面两行线性推出，不另立换算表。 */
+constexpr float kAccMps2PerLsb =
+    static_cast<float>(kModuleAccRangeG) * 9.80665f / 32768.0f;
+/* 陀螺的余量正是这 87.19% 的线性约定，×π/180 只是 deg→rad，无其他修正。 */
+constexpr float kGyroRpsPerLsb =
+    static_cast<float>(kModuleGyroRangeDps) / 32768.0f * 0.0174532925199433f;
+
 /** 公共测量负载：十个 int16，索引顺序即线上偏移顺序（小端）。 */
 struct payload_t
 {
@@ -51,8 +73,8 @@ struct can_frame_t
 /* ------------------------------ 编码 ------------------------------ */
 
 /** 由快照生成负载。
- *  解包参数取自快照本身（`imu_publish_params_t`），因此量程/方向切换时
- *  不会出现"新参数换算旧样本"的错配。 */
+ *  方向表取自快照本身（`imu_publish_params_t`），因此装配方向切换时
+ *  不会出现"新方向换算旧样本"的错配；量程系数是本文件的编译期常量。 */
 payload_t encode_payload(const imu_snapshot_t &snapshot);
 
 /** 生成完整 UART 帧。CRC 覆盖帧内 0..23 字节（含帧头与长度字段）。

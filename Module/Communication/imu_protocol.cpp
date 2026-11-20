@@ -66,17 +66,16 @@ payload_t encode_payload(const imu_snapshot_t &snapshot)
         const float installed = snapshot.accel[pm.inv_idx[i]];
         const float device    = pm.inv_neg[i] ? -installed : installed;
         payload.word[4U + i] = static_cast<int16_t>(
-            round_clamp(device / pm.acc_mps2_per_lsb, -32768, 32767));
+            round_clamp(device / kAccMps2PerLsb, -32768, 32767));
     }
 
     /* ③ 角速度：逆装配方向 → 加回驱动静态偏置 b → 除以 Sg */
     for (uint8_t i = 0U; i < 3U; ++i)
     {
         const float installed = snapshot.gyro[pm.inv_idx[i]];
-        const float device    = (pm.inv_neg[i] ? -installed : installed) +
-                                pm.gyro_bias_dev[i];
+        const float device    = pm.inv_neg[i] ? -installed : installed;
         payload.word[7U + i] = static_cast<int16_t>(
-            round_clamp(device / pm.gyro_rps_per_lsb, -32768, 32767));
+            round_clamp(device / kGyroRpsPerLsb, -32768, 32767));
     }
 
     return payload;

@@ -50,14 +50,11 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
      * 样本由 assume_*_point() 消费归还；无返回值时代可看两路 count。 */
     bool read() override;
 
-    /* 解包参数（只读）：通信层反向恢复器件原码时按这些值换算，保证与正向解包
-     * 同源——量程切换后不必在别处再维护一份灵敏度表。
-     * acc 单位 m/s²/LSB，gyro 单位 rad/s/LSB（= dps_per_lsb × π/180）。 */
-    [[nodiscard]] float acc_mps2_per_lsb() const;
-    [[nodiscard]] float gyro_rps_per_lsb() const;
-
-    /* 运行期诊断（只读）。err_bus/err_data/err_timeout 稳态都应恒为 0。
-     * err_data 是合计数；err_ovr / err_backpressure 用来区分成因。 */
+    private:
+    /* 运行期诊断（内部维护，不对外暴露）。
+     * err_bus/err_data/err_timeout 稳态应恒为 0；err_data 是合计，
+     * err_ovr / err_backpressure / err_overrun 用来区分成因。
+     * 正式版只在调试器里直接看 _fifo 的对应字段，不提供公有 getter。 */
     struct diag_t {
         uint32_t err_bus;          /* 总线失败（状态读或帧读失败） */
         uint32_t err_data;         /* 数据异常合计（见下方各分项） */
@@ -71,9 +68,10 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
                 _fifo.err_backpressure, _fifo.err_overrun};
     }
 
-    [[nodiscard]] uint32_t discontinuities() const { return _fifo.discontinuities; }
-
-    private:
+    /* 解包参数（只读）：仅供本类内部在标定/自检路径上换算，通信层已改为
+     * 按模块量程自行编码，不再依赖器件灵敏度。 */
+    [[nodiscard]] float acc_mps2_per_lsb() const;
+    [[nodiscard]] float gyro_rps_per_lsb() const;
     lsm6dsv16x_t& _device;
     float _acc_fs_g{4.0f};        /* g，init() 时按 imu_cfg_t 设定 */
     float _gyro_dps_per_lsb{0.070f}; /* UI 陀螺灵敏度，°/s/LSB，默认 ±2000 dps */
@@ -96,8 +94,7 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
         if (slot == nullptr) {
             ++_fifo.err_data;
             ++_fifo.err_backpressure;
-            ++_fifo.discontinuities;
-            return nullptr;
+                return nullptr;
         }
         *slot = acc_sample_t{}; /* 清残值，避免上一次的数据被误读 */
         return slot;
@@ -134,7 +131,6 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
         volatile uint32_t err_ovr;
         volatile uint32_t err_backpressure;
         volatile uint32_t err_overrun;
-        uint32_t discontinuities;      /* 数据丢失代次，由采集任务推进 */
         uint32_t pend_ts;
         bool     timestamp_valid;      /* 等到一个全新的时间戳字才重新交付样本 */
         bool     ovr_prev;

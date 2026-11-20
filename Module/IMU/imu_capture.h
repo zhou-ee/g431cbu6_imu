@@ -43,28 +43,7 @@ imu_data_t &data();
  *  head 的所有权在消费者侧，但实际存储属于驱动，因此由本模块代理。 */
 void release_consumed(uint16_t gyro_count, uint16_t acc_count);
 
-/** 加速度 / 角速度的灵敏度（m/s²/LSB、rad/s/LSB），封包反向换算要用。
- *  与驱动正向解包同源，换量程时不必在别处再维护一份。 */
-float acc_mps2_per_lsb();
-float gyro_rps_per_lsb();
-
-/** 驱动解包时扣除的静态零偏（器件系，rad/s）。封包时要加回去。 */
-const imu_cali_t &cali();
-
-/** 采集数据中断代次。与两路环形索引在同一个调度器挂起窗口内读取。 */
-uint32_t discontinuities();
-
-/** 采集侧诊断（累计）与耗时（1 s 窗口）。 */
-struct diag_t
-{
-    uint32_t err_bus;
-    uint32_t err_data;
-    uint32_t err_timeout;
-    uint32_t err_ovr;
-    uint32_t err_backpressure;
-    uint32_t err_overrun;
-};
-diag_t diag();
+/** 采集侧耗时（1 s 窗口）与轮次。 */
 uint32_t cap_rounds();
 uint32_t cap_us_max();
 uint32_t cap_us_avg();
@@ -82,12 +61,6 @@ extern volatile uint32_t imu_service_cap_rounds;     /* 采集轮次（1 kHz 硬
 extern volatile uint32_t imu_service_cap_us_max;     /* 单拍 read() 峰值耗时，µs */
 extern volatile uint32_t imu_service_cap_us_avg;     /* 单拍 read() 平均耗时，µs */
 extern volatile uint32_t imu_service_cap_stack_free; /* 采集任务栈余量（词） */
-extern volatile uint32_t imu_service_err_bus;        /* 总线失败次数 */
-extern volatile uint32_t imu_service_err_timeout;    /* 等完成通知超时次数 */
-extern volatile uint32_t imu_service_err_data;       /* 数据异常合计 */
-extern volatile uint32_t imu_service_err_ovr;        /* 其中：器件 FIFO 溢出 */
-extern volatile uint32_t imu_service_err_backpressure; /* 其中：缓冲满丢新样 */
-extern volatile uint32_t imu_service_err_overrun;      /* 其中：单次回读超限整批丢弃 */
 extern volatile int32_t  imu_service_init_result;    /* 采集初始化结果 0=成功 */
 extern volatile uint32_t imu_service_heap_free_min;  /* 任务拉起后的 FreeRTOS 堆余量 */
 }

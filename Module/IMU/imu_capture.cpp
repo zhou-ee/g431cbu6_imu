@@ -28,12 +28,6 @@ volatile uint32_t imu_service_cap_rounds       = 0U;
 volatile uint32_t imu_service_cap_us_max       = 0U;
 volatile uint32_t imu_service_cap_us_avg       = 0U;
 volatile uint32_t imu_service_cap_stack_free   = 0U;
-volatile uint32_t imu_service_err_bus          = 0U;
-volatile uint32_t imu_service_err_data         = 0U;
-volatile uint32_t imu_service_err_ovr          = 0U;
-volatile uint32_t imu_service_err_backpressure = 0U;
-volatile uint32_t imu_service_err_overrun      = 0U;
-volatile uint32_t imu_service_err_timeout      = 0U;
 volatile uint32_t imu_service_heap_free_min    = 0U;
 }
 
@@ -135,19 +129,6 @@ void capture_once()
         ++imu_service_read_ok;
     }
 
-    /* 驱动侧诊断直通（累计计数）：read() 失败时也要刷新，
-     * 否则看不出坏在哪一步。数据源是驱动自己的计数器，本层不重复统计。 */
-    if (s_imu != nullptr)
-    {
-        const lsm6dsv16x_drv_t::diag_t dg = s_imu->diag();
-        imu_service_err_bus          = dg.err_bus;
-        imu_service_err_data         = dg.err_data;
-        imu_service_err_timeout      = dg.err_timeout;
-        imu_service_err_ovr          = dg.err_ovr;
-        imu_service_err_backpressure = dg.err_backpressure;
-        imu_service_err_overrun      = dg.err_overrun;
-    }
-
     /* 采集侧耗时（含两段 DMA 等待，是"采集是否守住 1 ms"的直接口径）。 */
     const uint32_t us = static_cast<uint32_t>(
         (pyro::dwt_drv_t::get_current_ticks() - t0) / config::kCpuMhz);
@@ -182,38 +163,6 @@ void release_consumed(uint16_t gyro_count, uint16_t acc_count)
     if (s_imu == nullptr) { return; }
     s_imu->assume_gyro_point(gyro_count);
     s_imu->assume_acc_point(acc_count);
-}
-
-float acc_mps2_per_lsb()
-{
-    return (s_imu != nullptr) ? s_imu->acc_mps2_per_lsb() : 0.0f;
-}
-
-float gyro_rps_per_lsb()
-{
-    return (s_imu != nullptr) ? s_imu->gyro_rps_per_lsb() : 0.0f;
-}
-
-const imu_cali_t &cali()
-{
-    static const imu_cali_t s_empty{};
-    return (s_imu != nullptr) ? s_imu->read_imu_data().cali : s_empty;
-}
-
-uint32_t discontinuities()
-{
-    return (s_imu != nullptr) ? s_imu->discontinuities() : 0U;
-}
-
-diag_t diag()
-{
-    if (s_imu == nullptr)
-    {
-        return {0U, 0U, 0U, 0U, 0U, 0U};
-    }
-    const lsm6dsv16x_drv_t::diag_t d = s_imu->diag();
-    return {d.err_bus, d.err_data, d.err_timeout, d.err_ovr, d.err_backpressure,
-            d.err_overrun};
 }
 
 uint32_t cap_rounds()      { return imu_service_cap_rounds; }
