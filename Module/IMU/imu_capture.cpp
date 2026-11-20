@@ -75,11 +75,6 @@ pyro::spi_drv_t *s_spi_bus = nullptr;
 lsm6dsv16x_spi_t *s_bus = nullptr;
 lsm6dsv16x_drv_t *s_imu = nullptr;
 
-/* 最新一帧解包物理量（器件坐标系）。允许陈旧一拍：
- * 协议取"最新驱动物理量"语义，与融合结果同组封包。 */
-float s_last_acc_dev[3]  = {0.0f, 0.0f, 0.0f};
-float s_last_gyro_dev[3] = {0.0f, 0.0f, 0.0f};
-
 /* 采集侧 1 s 窗口统计（与融合侧各用各的边界，互不影响）。 */
 uint32_t s_cap_us_max  = 0U;
 uint32_t s_cap_us_sum  = 0U;
@@ -138,22 +133,6 @@ void capture_once()
     if (s_imu != nullptr && s_imu->read())
     {
         ++imu_service_read_ok;
-
-        imu_data_t &d = s_imu->read_imu_data();
-        if (d.gyro.available() != 0U)
-        {
-            const gyro_sample_t &g = d.gyro.cur();
-            s_last_gyro_dev[0] = g.Gyro[0];
-            s_last_gyro_dev[1] = g.Gyro[1];
-            s_last_gyro_dev[2] = g.Gyro[2];
-        }
-        if (d.acc.available() != 0U)
-        {
-            const acc_sample_t &a = d.acc.cur();
-            s_last_acc_dev[0] = a.Accel[0];
-            s_last_acc_dev[1] = a.Accel[1];
-            s_last_acc_dev[2] = a.Accel[2];
-        }
     }
 
     /* 驱动侧诊断直通（累计计数）：read() 失败时也要刷新，
@@ -221,14 +200,9 @@ const imu_cali_t &cali()
     return (s_imu != nullptr) ? s_imu->read_imu_data().cali : s_empty;
 }
 
-const float *last_acc_dev()
+uint32_t discontinuities()
 {
-    return s_last_acc_dev;
-}
-
-const float *last_gyro_dev()
-{
-    return s_last_gyro_dev;
+    return (s_imu != nullptr) ? s_imu->discontinuities() : 0U;
 }
 
 diag_t diag()
@@ -246,18 +220,6 @@ uint32_t cap_rounds()      { return imu_service_cap_rounds; }
 uint32_t cap_us_max()      { return imu_service_cap_us_max; }
 uint32_t cap_us_avg()      { return imu_service_cap_us_avg; }
 uint32_t cap_stack_free()  { return imu_service_cap_stack_free; }
-
-void clear_error_counters()
-{
-    /* 清驱动内部计数器 + 同步镜像，避免下一拍 capture_once() 把旧值写回来。 */
-    if (s_imu != nullptr) { s_imu->clear_error_counters(); }
-    imu_service_err_bus          = 0U;
-    imu_service_err_data         = 0U;
-    imu_service_err_timeout      = 0U;
-    imu_service_err_ovr          = 0U;
-    imu_service_err_backpressure = 0U;
-    imu_service_err_overrun      = 0U;
-}
 
 } // namespace capture
 } // namespace imu_module

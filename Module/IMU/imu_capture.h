@@ -31,7 +31,7 @@ namespace capture
  *  @retval PYRO_ERROR 器件自检或配置失败 */
 pyro::status_t init();
 
-/** 采集一拍：read() + 首帧物理量缓存 + 诊断计数 + 1 s 窗口统计。
+/** 采集一拍：read() + 诊断计数 + 1 s 窗口统计。
  *  内部两段 DMA 等待会挂起任务，不占 CPU。 */
 void capture_once();
 
@@ -51,10 +51,8 @@ float gyro_rps_per_lsb();
 /** 驱动解包时扣除的静态零偏（器件系，rad/s）。封包时要加回去。 */
 const imu_cali_t &cali();
 
-/** 最新一帧解包物理量（器件坐标系）。允许陈旧一拍——
- *  协议取"最新驱动物理量"语义，与本拍融合结果同组封包。 */
-const float *last_acc_dev();
-const float *last_gyro_dev();
+/** 采集数据中断代次。与两路环形索引在同一个调度器挂起窗口内读取。 */
+uint32_t discontinuities();
 
 /** 采集侧诊断（累计）与耗时（1 s 窗口）。 */
 struct diag_t
@@ -71,16 +69,6 @@ uint32_t cap_rounds();
 uint32_t cap_us_max();
 uint32_t cap_us_avg();
 uint32_t cap_stack_free();
-
-/** 清零累计错误计数（清的是驱动内部计数器，不是镜像量）。
- *
- * 用途：上电启动期采集任务先于融合任务跑起来，缓冲会被瞬间填满，
- * 于是每次上电都会固定产生几十次 err_backpressure。这段属于启动瞬态、
- * 不代表稳态能力，会让"持续堆积"这个判据失效。
- * 因此在 fusion::init()（消费侧就绪）之后调用一次，使该计数只反映稳态。
- *
- * @note 只清错误计数，不动 cap_rounds / read_ok 等进度量。 */
-void clear_error_counters();
 
 } // namespace capture
 } // namespace imu_module
