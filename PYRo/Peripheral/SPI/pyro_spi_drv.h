@@ -176,6 +176,57 @@ class spi_drv_t
      */
     void notify_from_isr();
 
+    /* Public Methods - Bus Ownership ---------------------------------------*/
+    /**
+     * @brief Acquires exclusive ownership of the bus.
+     * 取得总线独占权（多从机时串行化各设备的访问）。
+     *
+     * 【为什么需要】
+     * 一条 SPI 总线上可挂多颗从机，同一时刻只能有一笔事务在途。
+     * 原先各设备靠 `dma_busy()` 做「非阻塞检查 + 失败返回」，这既是
+     * TOCTOU（检查与占用之间可被抢占），又把「排队」误报成「总线故障」。
+     * 改为阻塞在互斥量上等待：**忙就挂起，不发起请求**。
+     *
+     * 【为什么是 public，而不是藏在 tx_dma/txrx_dma 内部】
+     * 一笔 DMA 事务在设备层是「发起 → wait_dma → 收取」三段调用：
+     *     read_regs_request()  ─ 发起
+     *     wait_dma(timeout)    ─ 挂起等完成通知
+     *     read_regs_collect()  ─ 取数据
+     * 锁必须跨越这三个函数保持。若在 tx_dma 内部加锁、返回前解锁，
+     * 那么 wait_dma 期间总线就处于「无人持有」状态，别的设备可抢入，
+     * 导致 _done 上出现两个等待者（二值信号量只能唤醒一个），
+     * 且完成钩子会被后发起者覆盖，CS 释放到错误的从机。
+     * 因此所有权边界必须由【设备层】掌管，驱动层只提供原语。
+     *
+     * 【使用约束】
+     *   · 仅任务上下文可调用（内部为 xSemaphoreTake）。
+     *   · 必须在【拉低 CS 之前】取得，在【整笔事务结束后】释放。
+     *   · 调用方应自己做幂等封装（见 lsm6dsv16x_spi_t::bus_acquire），
+     *     因为收尾点可能分散在多个函数里。
+     *   · 事务在途期间持有锁不会死锁——唤醒源是 DMA 完成中断，
+     *     不依赖任何其他任务的调度。
+     *
+     * @param waittime Timeout in ms; portMAX_DELAY waits forever.
+     *                 超时（ms）；portMAX_DELAY 表示永久等待。
+     * @retval PYRO_OK    已取得
+     * @retval PYRO_BUSY  超时未取得（调用方应放弃本次事务，绝不继续拉 CS）
+     * @retval PYRO_ERROR 互斥量不可用（构造时分配失败）
+     */
+    status_t acquire_bus(uint32_t waittime);
+
+    /**
+     * @brief Releases bus ownership.
+     * 释放总线独占权。
+     *
+     * @retval PYRO_OK 已释放
+     * @note 仅任务上下文可调用。ISR 中只做 cs_high() 与唤醒，
+     *       不在此释放（mutex 有优先级继承，必须用任务态 API）。
+     * @note 直接调用 xSemaphoreGive，重复释放由 FreeRTOS 忽略；
+     *       但调用方仍应通过幂等封装（bus_release）来配对，
+     *       避免"未持有却释放"掩盖逻辑错误。
+     */
+    status_t release_bus();
+
     /* Public Methods - Completion Hook -------------------------------------*/
     /**
      * @brief Registers a transaction-complete hook (ISR context).
@@ -189,6 +240,17 @@ class spi_drv_t
      *             回调函数指针；传 nullptr 注销。
      * @param ctx  Context pointer passed to the hook (usually the caller's this).
      *             回调上下文（通常为调用方 this）。
+     *
+     * @note 【一主多从】钩子是单槽的，且本实例被同总线的多个从机共享。
+     *       因此必须由设备在【每次发起事务前】设置成自己，不能在构造期
+     *       一次性注册（否则后构造的设备会覆盖前一个）。持有总线锁时设置即安全。
+     *
+     * @note 为什么用裸函数指针而非 std::function：
+     *       本回调在 ISR 中执行，且每笔事务前都要重设一次。实测改为
+     *       std::function 会增加 1312 B Flash，且每拍两次事务的赋值
+     *       使采集平均耗时从 157 µs 升至 173 µs（+10%）。
+     *       裸指针的调用是一次已知地址的跳转，赋值是两条字写入，
+     *       对 1 ms 采集周期最友好。
      */
     void set_cplt_hook(void (*hook)(void *), void *ctx);
 
@@ -235,10 +297,13 @@ class spi_drv_t
     /* Private Members ------------------------------------------------------*/
     SPI_HandleTypeDef *_hspi;      /* HAL handle for the peripheral. 外设 HAL 句柄 */
     SemaphoreHandle_t  _done;      /* Binary semaphore, given by ISR on completion. 完成信号量 */
+    SemaphoreHandle_t  _bus_mutex; /* Bus mutex, task context only. 总线互斥量 */
     volatile uint32_t  _err;       /* HAL error code snapshot. HAL 错误码快照 */
 
     /* Transaction-complete hook (ISR context, invoked before giving _done).
-     * 事务完成钩子（ISR 上下文，给完成信号量之前调用）。 */
+     * 事务完成钩子（ISR 上下文，给完成信号量之前调用）。
+     * 单槽：一条总线同一时刻只有一笔事务，故只需保存一个订阅者。
+     * 裸函数指针 + 上下文指针，赋值是两条字写入，ISR 中是一次已知地址跳转。 */
     void (*_cplt_hook)(void *){nullptr};
     void *_cplt_ctx{nullptr};
 };

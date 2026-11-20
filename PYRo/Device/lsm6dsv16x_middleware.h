@@ -115,6 +115,18 @@ private:
     /* 在途异步小读的数据长度（不含地址字节），0 表示没有在途小读。 */
     uint16_t _sm_len{};
 
+    /* 【总线持锁状态】本对象当前是否持有总线锁。
+     * 必须自己记录而不能靠 dma_busy()/_prev_len 推断：同一把总线锁会在
+     * 「发起 → wait_dma → collect」之间跨调用保持，而收尾动作可能发生在
+     * 不同函数里（wait_dma / collect / read_fifo(len=0)），
+     * 靠状态推断必然出现重复释放。用显式标志把 acquire/release 做成幂等。 */
+    bool _holding_bus{false};
+
+    /* 幂等的总线获取/释放：内部维护 _holding_bus，重复调用安全。
+     * bus_acquire 在总线被占用时【挂起等待】，而不是立即失败。 */
+    pyro::status_t bus_acquire(uint32_t timeout_ms);
+    void           bus_release();
+
     /* 大读的收发暂存（随对象静态生命周期，不进调用者栈，支撑 FIFO 大批量读）。
      * 维度是 [槽][字节]：外层 2 个槽，内层每槽 LSM6DSV16X_MAX_BURST+1 字节，
      * 两槽在内存里彼此独立、互不重叠——这是"一笔 DMA 在途时另一槽可安全交付
