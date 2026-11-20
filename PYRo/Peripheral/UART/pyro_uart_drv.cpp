@@ -136,6 +136,11 @@ status_t uart_drv_t::write(const uint8_t *p, const uint16_t size)
     return PYRO_ERROR;
 }
 
+bool uart_drv_t::tx_ready() const
+{
+    return _huart != nullptr && _huart->gState == HAL_UART_STATE_READY;
+}
+
 /* Reception Control Methods -------------------------------------------------*/
 PYRO_ISR_TEXT status_t uart_drv_t::enable_rx_dma()
 {

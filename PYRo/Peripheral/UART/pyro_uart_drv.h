@@ -149,6 +149,9 @@ public:
      */
     status_t write(const uint8_t *p, uint16_t size);
 
+    /** 单发送者可据此判断上一次发送的 DMA 缓冲是否可以复用。 */
+    [[nodiscard]] bool tx_ready() const;
+
     /* Public Methods - Reception Control ------------------------------------*/
     /**
      * @brief Starts DMA reception in ReceiveToIdle mode.

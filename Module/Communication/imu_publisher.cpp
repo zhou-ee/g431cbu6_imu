@@ -25,6 +25,7 @@ extern "C" {
 volatile uint32_t imu_pub_frames       = 0U;
 volatile uint32_t imu_pub_can_busy     = 0U;
 volatile uint32_t imu_pub_can_err      = 0U;
+volatile uint32_t imu_pub_uart_sent    = 0U;
 volatile uint32_t imu_pub_uart_busy    = 0U;
 volatile uint32_t imu_pub_uart_err     = 0U;
 volatile uint32_t imu_pub_snapshot_seq = 0U;
@@ -56,6 +57,10 @@ class pub_task_t final : public pyro::task_base_t
   protected:
     pyro::status_t init() override
     {
+        if (_transport_ready)
+        {
+            return pyro::PYRO_OK;
+        }
         if (config::kPublishCan)
         {
             /* init() 内部完成位时序/滤波器配置，start() 才真正进入 Normal 模式
@@ -83,12 +88,14 @@ class pub_task_t final : public pyro::task_base_t
             /* 触发单例构造并开启 RX DMA（本版只用 TX，但驱动要求先 enable）。 */
             pyro::bsp_uart::init_all();
         }
+        _transport_ready = true;
         return pyro::PYRO_OK;
     }
 
     void run_loop() override
     {
         uint32_t divisor = 0U;
+        TickType_t poll_wake = xTaskGetTickCount();
         for (;;)
         {
             /* 等待"融合产出了新快照"。由 imu_module.cpp 把算法任务与本任务
@@ -111,8 +118,7 @@ class pub_task_t final : public pyro::task_base_t
             else
             {
                 /* 退化路径：未绑定信号量时按 1 ms 轮询（独立测试用） */
-                TickType_t tick = xTaskGetTickCount();
-                vTaskDelayUntil(&tick, config::kPublishPeriodMs);
+                vTaskDelayUntil(&poll_wake, pdMS_TO_TICKS(config::kPublishPeriodMs));
             }
 
             /* 快照是值拷贝：与采集任务零共享，读侧不会阻塞写侧。
@@ -123,21 +129,31 @@ class pub_task_t final : public pyro::task_base_t
 
             if (config::kPublishUart)
             {
-                uint8_t frame[protocol::kUartFrameSize];
-                (void)protocol::encode_uart_frame(payload, frame);
-                for (std::size_t i = 0U; i < protocol::kUartFrameSize; ++i)
+                auto &uart = pyro::bsp_uart::get_uart2();
+                if (!uart.tx_ready())
                 {
-                    imu_pub_uart_last[i] = frame[i]; /* 调试镜像：实际提交的字节 */
+                    ++imu_pub_uart_busy;
                 }
-                const pyro::status_t st = pyro::bsp_uart::get_uart2().write(
-                    frame, static_cast<uint16_t>(protocol::kUartFrameSize));
-                if (st == pyro::PYRO_BUSY)
+                else
                 {
-                    ++imu_pub_uart_busy; /* 上一帧还没发完：跳过本拍，不排队 */
-                }
-                else if (st != pyro::PYRO_OK)
-                {
-                    ++imu_pub_uart_err;
+                    (void)protocol::encode_uart_frame(payload, _uart_frame);
+                    const pyro::status_t st = uart.write(_uart_frame, sizeof(_uart_frame));
+                    if (st == pyro::PYRO_OK)
+                    {
+                        for (std::size_t i = 0U; i < sizeof(_uart_frame); ++i)
+                        {
+                            imu_pub_uart_last[i] = _uart_frame[i];
+                        }
+                        ++imu_pub_uart_sent;
+                    }
+                    else if (st == pyro::PYRO_BUSY)
+                    {
+                        ++imu_pub_uart_busy;
+                    }
+                    else
+                    {
+                        ++imu_pub_uart_err;
+                    }
                 }
             }
 
@@ -145,39 +161,32 @@ class pub_task_t final : public pyro::task_base_t
             {
                 protocol::can_frame_t frames[protocol::kCanFrameCount];
                 protocol::encode_can_frames(config::kNodeId, payload, frames);
-                imu_pub_can_base = frames[0].id;
-                for (std::size_t f = 0U; f < protocol::kCanFrameCount; ++f)
+                pyro::can_drv_t::tx_frame_t group[protocol::kCanFrameCount];
+                for (std::size_t i = 0U; i < protocol::kCanFrameCount; ++i)
                 {
-                    for (std::size_t b = 0U; b < 8U; ++b)
-                    {
-                        imu_pub_can_last[f][b] = frames[f].data[b];
-                    }
+                    group[i] = {frames[i].id, frames[i].data};
                 }
-
-                /* 整组按序提交：任一阵列返回忙就放弃本组剩余帧。
-                 * 不重试——下一拍会带来更新的快照，重试会把旧组插到新组前面，
-                 * 反而破坏接收端"按到达顺序配对"的前提。 */
-                bool group_ok = true;
-                for (std::size_t f = 0U; f < protocol::kCanFrameCount; ++f)
+                const pyro::status_t st =
+                    pyro::bsp_can::get_can1().send_group(group, protocol::kCanFrameCount);
+                if (st == pyro::PYRO_OK)
                 {
-                    const pyro::status_t st = pyro::bsp_can::get_can1().send_msg(
-                        frames[f].id, frames[f].data);
-                    if (st == pyro::PYRO_BUSY)
+                    imu_pub_can_base = frames[0].id;
+                    for (std::size_t f = 0U; f < protocol::kCanFrameCount; ++f)
                     {
-                        ++imu_pub_can_busy;
-                        group_ok = false;
-                        break;
+                        for (std::size_t b = 0U; b < 8U; ++b)
+                        {
+                            imu_pub_can_last[f][b] = frames[f].data[b];
+                        }
                     }
-                    if (st != pyro::PYRO_OK)
-                    {
-                        ++imu_pub_can_err;
-                        group_ok = false;
-                        break;
-                    }
-                }
-                if (group_ok)
-                {
                     ++imu_pub_frames;
+                }
+                else if (st == pyro::PYRO_BUSY)
+                {
+                    ++imu_pub_can_busy;
+                }
+                else
+                {
+                    ++imu_pub_can_err;
                 }
             }
             else
@@ -217,6 +226,11 @@ class pub_task_t final : public pyro::task_base_t
              * 节拍由融合完成事件驱动，这是"发最新数据"与"无竞态"的来源。 */
         }
     }
+
+  private:
+    // 该发布任务是 USART2 的唯一发送者。HAL 完成发送后才允许改写。
+    uint8_t _uart_frame[protocol::kUartFrameSize]{};
+    bool _transport_ready = false;
 };
 
 pub_task_t s_pub_task;
