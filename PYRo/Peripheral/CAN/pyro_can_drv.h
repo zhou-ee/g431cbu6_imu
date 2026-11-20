@@ -63,6 +63,15 @@ public:
      * 因此"一组多帧"的原子性由调用方用有界队列 + 整组重试保证，
      * 不能靠本函数回滚——回滚会把同组已入队的前几帧一起丢掉。 */
     status_t send_msg(uint32_t id, const uint8_t *data) const;
+
+    struct tx_frame_t
+    {
+        uint32_t id;
+        const uint8_t *data; // 8 字节有效载荷
+    };
+
+    /** 在同一个临界区里预检并提交全组。容量不足时不入队任何帧。 */
+    status_t send_group(const tx_frame_t *frames, uint32_t count) const;
     status_t register_rx_msg(can_msg_buffer_t *msg_buffer);
     status_t handle_rx_msg(uint32_t id, const uint8_t *data);
 

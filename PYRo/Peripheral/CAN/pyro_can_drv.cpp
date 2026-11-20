@@ -209,60 +209,54 @@ pyro::status_t can_drv_t::poll_rx(uint32_t &id, uint8_t data[8]) const
 
 pyro::status_t can_drv_t::send_msg(const uint32_t id, const uint8_t *data) const
 {
-    if (nullptr == _hfdcan || nullptr == data)
-        return pyro::PYRO_PARAM_ERROR;
+    const tx_frame_t frame{id, data};
+    return send_group(&frame, 1U);
+}
 
-    if (HAL_FDCAN_STATE_BUSY != _hfdcan->State)
-        return pyro::PYRO_BUSY;
+status_t can_drv_t::send_group(const tx_frame_t *frames, uint32_t count) const
+{
+    if (_hfdcan == nullptr || frames == nullptr || count == 0U)
+        return PYRO_PARAM_ERROR;
+    for (uint32_t i = 0U; i < count; ++i)
+    {
+        if (frames[i].data == nullptr || frames[i].id > 0x7FFU)
+            return PYRO_PARAM_ERROR;
+    }
 
+    if (_hfdcan->State != HAL_FDCAN_STATE_BUSY)
+        return PYRO_BUSY;
     const status_t recover_status = recover_bus_off(_hfdcan);
-    if (PYRO_OK != recover_status)
+    if (recover_status != PYRO_OK)
         return recover_status;
 
-    FDCAN_TxHeaderTypeDef tx_header;
+    FDCAN_TxHeaderTypeDef header{};
+    header.IdType              = FDCAN_STANDARD_ID;
+    header.TxFrameType         = FDCAN_DATA_FRAME;
+    header.DataLength          = FDCAN_DLC_BYTES_8;
+    header.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    header.BitRateSwitch       = FDCAN_BRS_OFF;
+    header.FDFormat            = FDCAN_CLASSIC_CAN;
+    header.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
 
-    tx_header.IdType              = FDCAN_STANDARD_ID;
-    tx_header.Identifier          = id;
-    tx_header.TxFrameType         = FDCAN_DATA_FRAME;
-    tx_header.DataLength          = FDCAN_DLC_BYTES_8;
-    tx_header.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    tx_header.BitRateSwitch       = FDCAN_BRS_OFF;
-    tx_header.FDFormat            = FDCAN_CLASSIC_CAN;
-    tx_header.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
-    tx_header.MessageMarker       = 0;
-
-    /* 队列满只报告忙，**绝不撤销在发请求**。
-     * G4 的发送 FIFO 固定 3 个元素（消息 RAM 布局由 HAL 编译期宏固定），
-     * 一组三帧恰好占满；若在这里 abort 掉 TXBRP，同一组已入队的前几帧会一起
-     * 丢失，接收端既无法用序号也无法用到达顺序判断"丢组"还是"错序"。
-     * 积压管理属于调用方：有界队列 + 重试 + 整组推进（见 Module/PROTOCOL.md）。 */
+    // 持锁期间只有本任务能占用发送槽，控制器发送完成只会增加空槽。
     taskENTER_CRITICAL();
-    if (0U == HAL_FDCAN_GetTxFifoFreeLevel(_hfdcan))
+    status_t result = PYRO_BUSY;
+    if (HAL_FDCAN_GetTxFifoFreeLevel(_hfdcan) >= count)
     {
-        _hfdcan->ErrorCode &= ~HAL_FDCAN_ERROR_FIFO_FULL;
-        taskEXIT_CRITICAL();
-        return pyro::PYRO_BUSY;
-    }
-
-    const HAL_StatusTypeDef hal_status =
-        HAL_FDCAN_AddMessageToTxFifoQ(_hfdcan, &tx_header, data);
-
-    if (HAL_OK != hal_status)
-    {
-        if (0U != (_hfdcan->ErrorCode & HAL_FDCAN_ERROR_FIFO_FULL))
+        result = PYRO_OK;
+        for (uint32_t i = 0U; i < count; ++i)
         {
-            /* 竞态下 FIFO 刚被填满：同样只报告忙，保留已入队的帧 */
-            _hfdcan->ErrorCode &= ~HAL_FDCAN_ERROR_FIFO_FULL;
-            taskEXIT_CRITICAL();
-            return pyro::PYRO_BUSY;
+            header.Identifier = frames[i].id;
+            if (HAL_FDCAN_AddMessageToTxFifoQ(_hfdcan, &header, frames[i].data) != HAL_OK)
+            {
+                // 预检后硬件仍可故障。这里报告错误，并保留已交给控制器的帧。
+                result = PYRO_ERROR;
+                break;
+            }
         }
-
-        taskEXIT_CRITICAL();
-        return pyro::PYRO_ERROR;
     }
     taskEXIT_CRITICAL();
-
-    return pyro::PYRO_OK;
+    return result;
 }
 
 pyro::status_t can_drv_t::register_rx_msg(can_msg_buffer_t *msg_buffer)
