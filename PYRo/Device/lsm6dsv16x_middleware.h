@@ -32,7 +32,7 @@ public:
     /* FIFO 流水读取。request_len 为本次请求字节数，可为 0 以仅取回完成数据；
      * received_len 独立报告本次交付字节数，容量须覆盖请求和待交付的完整帧。
      * 返回 false 时 received_len 仍可能非零（上一帧已交付，本次启动失败）。
-     * 默认实现同步读取；DMA 实现交付已完成帧后发起下一笔，忙时返回 true/0。
+     * 默认实现同步读取。DMA 实现须先成功 wait_dma，才可收取上一帧。
      * 调用方始终先处理 received_len，再处理返回的总线状态。 */
     virtual bool read_fifo(uint8_t *buf, uint16_t capacity, uint16_t request_len,
                            uint16_t &received_len);
@@ -115,12 +115,9 @@ private:
     /* 在途异步小读的数据长度（不含地址字节），0 表示没有在途小读。 */
     uint16_t _sm_len{};
 
-    /* 【总线持锁状态】本对象当前是否持有总线锁。
-     * 必须自己记录而不能靠 dma_busy()/_prev_len 推断：同一把总线锁会在
-     * 「发起 → wait_dma → collect」之间跨调用保持，而收尾动作可能发生在
-     * 不同函数里（wait_dma / collect / read_fifo(len=0)），
-     * 靠状态推断必然出现重复释放。用显式标志把 acquire/release 做成幂等。 */
+    /* 发起至 wait_dma 完成期间持有总线。完成结果由本设备保存到收取为止。 */
     bool _holding_bus{false};
+    bool _result_ready{false};
 
     /* 幂等的总线获取/释放：内部维护 _holding_bus，重复调用安全。
      * bus_acquire 在总线被占用时【挂起等待】，而不是立即失败。 */
