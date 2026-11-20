@@ -129,6 +129,7 @@ bool lsm6dsv16x_drv_t::init() {
         return false;
     }
 
+    _fifo.timestamp_valid = false;
     /* 5) 时间戳计数器：独立于 FIFO 的器件特性，无条件使能后清零
      *    （FUNCTIONS_ENABLE(50h) 主页面无需切 bank；tick 秒数由 FREQ_FINE 校正）。
      *    FIFO 路径逐槽批入时间戳字；直读回退路径直接读 TIMESTAMP0~3 寄存器。 */
@@ -192,20 +193,14 @@ bool lsm6dsv16x_drv_t::read_direct() {
     /* 20h~2Dh 解包：温度 1 + 陀螺 3 + 加速度 3，逐个小端 int16 */
     _data.temperature = (static_cast<float>(load_i16le(&_fifo_raw[0])) / TEMP_LSB_PER_C) + TEMP_ZERO_C;
 
-    /* 时间戳计数器（TIMESTAMP0~3，同样逐字节小读）；读数失败则沿用上次值，下一帧自愈 */
-    uint8_t ts[4] = {0U, 0U, 0U, 0U};
-    bool    ts_ok = true;
-    for (uint16_t i = 0U; i < 4U; ++i) {
-        if (!_device.read_regs(static_cast<uint8_t>(TIMESTAMP0 + i), &ts[i], 1U)) {
-            ts_ok = false;
-            break;
-        }
-    }
-    if (ts_ok) {
-        _fifo.pend_ts = load_u32le(ts);
-    } else {
+    /* 一个连续读事务取回 32 位时间戳。失败时不把旧时间戳赋给新样本。 */
+    uint8_t ts[4]{};
+    if (!_device.read_regs(TIMESTAMP0, ts, sizeof(ts))) {
         ++_fifo.err_bus;
+        ++_fifo.discontinuities;
+        return false;
     }
+    _fifo.pend_ts = load_u32le(ts);
 
     /* 两路各自组装 1 个样本（直读路径独立实现，不借道 FIFO 字格式）*/
     /* SPSC 生产侧：先 reserve 拿槽（满则返回 nullptr，计 err_data），
@@ -286,6 +281,8 @@ bool lsm6dsv16x_drv_t::read_fifo_batch() {
     if (ovr_now && !_fifo.ovr_prev) {
         ++_fifo.err_data; /* continuous 模式满后覆盖最旧：已丢样本 */
         ++_fifo.err_ovr;  /* 器件侧溢出，与软件背压分开计数 */
+        ++_fifo.discontinuities;
+        _fifo.timestamp_valid = false;
     }
     _fifo.ovr_prev = ovr_now;
 
@@ -304,11 +301,13 @@ bool lsm6dsv16x_drv_t::read_fifo_batch() {
      * 依然超限，会永久卡在这个分支里采集不到任何数据。
      * 排空方式 = 按当前 diff 发起一次丢弃读（读到 _fifo_raw 里随即忽略），
      * 单次最多 MAX_WORDS_PER_XFER 字，若仍未排空则留到下一拍继续。
-     * 这段不做解析，因此不产生样本、不动 pend_ts。 */
+     * 丢弃后恢复交付前，先等到一个新的时间戳字。 */
     const uint16_t cap = _data.cfg.fifo_max_words_per_read;
     if (cap != 0U && diff > cap) {
         ++_fifo.err_data;
-        ++_fifo.err_overrun; /* 独立计数：区分"积压丢弃"与"缓冲背压" */
+        ++_fifo.err_overrun;
+        ++_fifo.discontinuities;
+        _fifo.timestamp_valid = false;
 
         uint16_t drain_words = diff;
         if (drain_words > LSM6DSV16X_MAX_WORDS_PER_XFER) {
@@ -346,20 +345,26 @@ bool lsm6dsv16x_drv_t::read_fifo_batch() {
     }
     if (!_device.wait_dma(LSM6DSV16X_CPLT_TIMEOUT_MS)) {
         ++_fifo.err_timeout;
+        ++_fifo.discontinuities;
+        _fifo.timestamp_valid = false;
         return false;
     }
     /* request_len=0：只取回已完成的那一帧，不再发起新请求 */
     if (!_device.read_fifo(_fifo_raw, sizeof(_fifo_raw), 0U, received_len)) {
         ++_fifo.err_bus;
+        ++_fifo.discontinuities;
+        _fifo.timestamp_valid = false;
         return false;
     }
 
     /* ---- ④ 解包：逐 7 字节字按 TAG 分派到两路样本流 ---- */
     const uint16_t count = static_cast<uint16_t>(received_len / 7U);
+    const uint16_t gyro_tail = _data.gyro.tail;
+    const uint16_t acc_tail = _data.acc.tail;
     for (uint16_t i = 0U; i < count; ++i) {
         fifo_parse_word(&_fifo_raw[i * 7U]);
     }
-    return count != 0U;
+    return _data.gyro.tail != gyro_tail || _data.acc.tail != acc_tail;
 }
 
 /**
@@ -375,6 +380,7 @@ bool lsm6dsv16x_drv_t::read_fifo_batch() {
 void lsm6dsv16x_drv_t::fifo_parse_word(const uint8_t *word) {
     switch (word[0] & FIFO_DATA_OUT_TAG_TAG_SENSOR_MSK) {
         case FIFO_DATA_OUT_TAG_GYRO: {
+            if (!_fifo.timestamp_valid) { break; }
             gyro_sample_t *ps = gyro_reserve(); /* 满则 nullptr，已计 err_data */
             if (ps == nullptr) {
                 break;
@@ -392,6 +398,7 @@ void lsm6dsv16x_drv_t::fifo_parse_word(const uint8_t *word) {
         }
 
         case FIFO_DATA_OUT_TAG_XL: {
+            if (!_fifo.timestamp_valid) { break; }
             acc_sample_t *ps = acc_reserve();
             if (ps == nullptr) {
                 break;
@@ -409,6 +416,7 @@ void lsm6dsv16x_drv_t::fifo_parse_word(const uint8_t *word) {
 
         case FIFO_DATA_OUT_TAG_TIMESTAMP:
             _fifo.pend_ts = load_u32le(word + 1);
+            _fifo.timestamp_valid = true;
             break;
 
         case FIFO_DATA_OUT_TAG_TEMP:

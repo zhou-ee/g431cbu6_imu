@@ -71,17 +71,7 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
                 _fifo.err_backpressure, _fifo.err_overrun};
     }
 
-    /** 清零累计错误计数（不动 ovr_prev 边沿状态与 pend_ts）。
-     *  供产品层在"启动瞬态结束、消费侧就绪"时调用一次，
-     *  使 err_* 只反映稳态，便于用其判断持续堆积。 */
-    void clear_error_counters() {
-        _fifo.err_bus = 0U;
-        _fifo.err_data = 0U;
-        _fifo.err_timeout = 0U;
-        _fifo.err_ovr = 0U;
-        _fifo.err_backpressure = 0U;
-        _fifo.err_overrun = 0U;
-    }
+    [[nodiscard]] uint32_t discontinuities() const { return _fifo.discontinuities; }
 
     private:
     lsm6dsv16x_t& _device;
@@ -105,7 +95,8 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
         acc_sample_t *slot = _data.acc.reserve();
         if (slot == nullptr) {
             ++_fifo.err_data;
-            ++_fifo.err_backpressure; /* 消费者跟不上：与器件溢出分开计数 */
+            ++_fifo.err_backpressure;
+            ++_fifo.discontinuities;
             return nullptr;
         }
         *slot = acc_sample_t{}; /* 清残值，避免上一次的数据被误读 */
@@ -143,9 +134,10 @@ class lsm6dsv16x_drv_t : public imu_base_drv {
         volatile uint32_t err_ovr;
         volatile uint32_t err_backpressure;
         volatile uint32_t err_overrun;
-        uint32_t pend_ts;              /* 当前槽时间戳，跨调用保持（读边界可能切在槽中间；
-                                          个别槽无时间戳字时沿用上次值，下一槽即自愈）*/
-        bool     ovr_prev;             /* 溢出标志（上升沿计数，兼容标志清除语义）*/
+        uint32_t discontinuities;      /* 数据丢失代次，由采集任务推进 */
+        uint32_t pend_ts;
+        bool     timestamp_valid;      /* 等到一个全新的时间戳字才重新交付样本 */
+        bool     ovr_prev;
     };
     fifo_state_t _fifo{};
 

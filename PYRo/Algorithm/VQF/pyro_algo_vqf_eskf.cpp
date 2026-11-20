@@ -115,7 +115,8 @@ status_t vqf_eskf_t::configure(const config_t &config)
             !matrix::is_finite(square(value)) || square(value) == 0.0f)
             return PYRO_PARAM_ERROR;
     if (!matrix::is_finite(config.rest_min_t) || config.rest_min_t < 0.0f ||
-        !matrix::is_finite(config.acc_recovery_t) || config.acc_recovery_t < 0.0f)
+        !matrix::is_finite(config.acc_recovery_t) || config.acc_recovery_t < 0.0f ||
+        !matrix::is_finite(config.max_sample_gap_s) || config.max_sample_gap_s < 0.0f)
         return PYRO_PARAM_ERROR;
     const float derived[] = {
         square(config.bias_sigma_init * deg_to_rad),
@@ -221,6 +222,8 @@ status_t vqf_eskf_t::update(const imu_data_t &data)
     err_stage = 0U;
     _state.consumed_gyr = 0;
     _state.consumed_acc = 0;
+    _state.updated_gyr = 0;
+    _state.updated_acc = 0;
     if (!_error_kf.is_initialized())
         return PYRO_NOT_FOUND;
     if (!valid_stream(data.gyro) || !valid_stream(data.acc))
@@ -246,8 +249,8 @@ status_t vqf_eskf_t::update(const imu_data_t &data)
         return PYRO_PARAM_ERROR;
     }
 
-    uint8_t &gyr_index = _state.consumed_gyr;
-    uint8_t &acc_index = _state.consumed_acc;
+    uint16_t &gyr_index = _state.consumed_gyr;
+    uint16_t &acc_index = _state.consumed_acc;
     status_t batch_result = PYRO_OK;
     while (gyr_index < gyr_batch || acc_index < acc_batch)
     {
@@ -264,13 +267,20 @@ status_t vqf_eskf_t::update(const imu_data_t &data)
         const uint32_t ticks = timestamp - clock.timestamp;
         if (clock.initialized && ticks >= (uint32_t{1} << 31))
         {
-            err_stage = 4; /* 时间戳倒退 */
+            // 丢弃坏样本，但保留后续样本，避免队头永远阻塞。
+            ++(gyro_first ? gyr_index : acc_index);
+            err_stage = 4;
             return PYRO_PARAM_ERROR;
         }
         const float dt = clock.initialized ? static_cast<float>(ticks) * data.timestamp_tick_s : 0.0f;
         if (!std::isfinite(dt) || (clock.initialized && ticks > 0 && dt <= 0.0f))
         {
             err_stage = 5;
+            return PYRO_PARAM_ERROR;
+        }
+        if (_config.max_sample_gap_s > 0.0f && dt > _config.max_sample_gap_s)
+        {
+            err_stage = 6;
             return PYRO_PARAM_ERROR;
         }
         const bool duplicate = clock.initialized && ticks == 0;
@@ -297,6 +307,11 @@ status_t vqf_eskf_t::update(const imu_data_t &data)
                 result = _update_acc(acc, dt);
             }
             ++acc_index;
+        }
+        if (!duplicate && (result == PYRO_OK || result == PYRO_WARNING))
+        {
+            (gyro_first ? _state.updated_gyr : _state.updated_acc) =
+                gyro_first ? gyr_index : acc_index;
         }
         clock = {timestamp, true};
         _state.timestamp_tick_s = data.timestamp_tick_s;
@@ -824,6 +839,8 @@ void vqf_eskf_t::get_state(state_t &result) const
     result.initialized = _state.tilt_initialized;
     result.consumed_gyr = _state.consumed_gyr;
     result.consumed_acc = _state.consumed_acc;
+    result.updated_gyr = _state.updated_gyr;
+    result.updated_acc = _state.updated_acc;
     result.acc_confidence = _state.acc_confidence;
     result.acc_nis = _state.acc_nis;
     result.acc_rejected = _state.acc_rejected;

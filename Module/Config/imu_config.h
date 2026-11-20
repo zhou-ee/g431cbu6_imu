@@ -61,13 +61,14 @@ constexpr uint16_t kCalibrateTimes  = 500U;
  * 另加超时兜底，避免运动开机时永远给不出可信 yaw。
  * 注意量纲：bias_sigma 是 rad/s。 */
 constexpr float    kHeadingBiasSigmaRps = 0.005f; /* rad/s，≈0.29 °/s */
-constexpr uint32_t kHeadingTimeoutRounds = 5000U; /* 5 s @1 kHz 融合轮次 */
+constexpr uint32_t kHeadingTimeoutMs = 5000U;
 
 /* ============================ 发布（协议 v1） ============================ */
 constexpr uint8_t  kNodeId        = 1U;    /* 0..31，CAN base_id = 0x300 + id*0x10 */
 constexpr bool     kPublishCan    = true;
 constexpr bool     kPublishUart   = true;
-constexpr uint32_t kPublishPeriodMs = 1U;  /* 1 kHz */
+constexpr uint32_t kPublishPeriodMs = 1U;   /* 1 kHz 采集周期 */
+constexpr uint32_t kSampleStaleMs    = 20U; /* 任一路没有新样本时的失效期限 */
 
 /* 台架自测开关：true 时把 FDCAN1 切到 internal loopback（硬件自答 ACK），
  * 发布层会轮询取回自己发的三帧并逐字节比对，用 imu_pub_can_rx / imu_pub_can_rx_bad
@@ -75,10 +76,10 @@ constexpr uint32_t kPublishPeriodMs = 1U;  /* 1 kHz */
 constexpr bool     kCanLoopbackSelfTest = false;
 
 /* ============================ 任务与资源 ============================
- * 三个常驻任务都在 FreeRTOS 堆（12 KB）里：
+ * 三个常驻任务都在 FreeRTOS 堆（16 KB）里：
  *   ins_cap  —— 只做 read()（FIFO → 环形缓冲），1 ms 硬周期，最高优先级
  *   ins_algo —— 只做 update()（融合 + 快照发布），尽力而为，低于采集
- *   imu_pub  —— 只做"取快照 → 编码 → 提交"，与 ins_algo 同级
+ *   imu_pub  —— 只做"取快照 → 编码 → 提交"，低于 ins_algo
  *
  * 为什么采集与算法拆开（2026-11-16 版，在 SPSC 环形缓冲落地之后）：
  *   ① 采集周期不再被融合耗时打穿：update() 峰值再高也只降低姿态更新率；
@@ -169,6 +170,7 @@ inline pyro::vqf_eskf_t::config_t vqf_config()
     cfg.motion_bias_est_enabled = false;
     cfg.rest_bias_est_enabled   = true;
     cfg.acc_update_period = 0.002f;
+    cfg.max_sample_gap_s = 6.0f / ((kAccOdrHz < kGyroOdrHz) ? kAccOdrHz : kGyroOdrHz);
     return cfg;
 }
 

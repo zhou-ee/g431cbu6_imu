@@ -54,6 +54,7 @@ struct vqf_config_t
     float acc_norm_tolerance = 1.0f; ///< 模长偏差降权尺度，m/s²。
     float acc_vibration_tolerance = 1.0f; ///< 近惯性系高频残差 RMS 降权尺度，m/s²。
     float acc_update_period = 0.002f; ///< ESKF 观测最小间隔，陀螺按全部时间戳传播。
+    float max_sample_gap_s = 0.0f; ///< 每路允许的最大采样间隔。0 表示不限制。
     float acc_recovery_t = 0.2f; ///< 启动及受扰后，可信加速度的连续确认时间。
     float acc_nis_threshold = 9.21034f; ///< 两维倾斜新息门限，默认 χ²(2) 的 99% 分位数。
 };
@@ -82,8 +83,10 @@ class vqf_eskf_t
         float rest_t = 0.0f;
         vector3_t rest_gyr_lp{};
         vector3_t rest_acc_lp{};
-        uint8_t consumed_gyr = 0;
-        uint8_t consumed_acc = 0;
+        uint16_t consumed_gyr = 0;
+        uint16_t consumed_acc = 0;
+        uint16_t updated_gyr = 0; ///< 最近一次实际更新时间的样本下标 + 1，0 表示未更新。
+        uint16_t updated_acc = 0;
         float acc_confidence = 0.0f; ///< 最近加速度的可信度，0..1。
         float acc_nis = 0.0f; ///< 最近一次两维倾斜观测的 NIS。
         bool acc_rejected = false; ///< 最近样本受到门控或处于恢复等待。
@@ -101,9 +104,10 @@ class vqf_eskf_t
     status_t reset(const vector3_t &bias = vector3_t{}, float sigma = 0.0f);
     /** 按时间戳合并两路未消费样本，同时间戳先陀螺后加速度。
      * 各路各自单调并共享 tick_s，批次时间跨度 < 2^31 tick，支持 uint32 回绕。
-     * 首帧建立时钟，重复时间戳消费后返回 WARNING，倒退帧保留并报 PARAM_ERROR。
-     * 设备计数器重置或 tick_s 改变前调用 reset。
-     * consumed_gyr/acc 为本次实际消费前缀，调用方按计数归还。
+     * 首帧建立时钟，重复时间戳消费后返回 WARNING。倒退帧消费后报 PARAM_ERROR。
+     * 超过 max_sample_gap_s 的样本保留，调用方可 reset 后用它建立新基准。
+     * 设备计数器重置或 tick_s 改变时调用 reset。
+     * consumed_gyr/acc 为本次实际消费前缀，updated_gyr/acc 为最近一次更新时间的前缀长度。
      * 门控/恢复等待返回 WARNING 并继续本批。其他错误终止批次，保留已提交步骤。
      * 加速度帧在处理开始后计入消费量，避免重试时重复推进滤波历史。 */
     status_t update(const imu_data_t &data);
@@ -112,7 +116,7 @@ class vqf_eskf_t
     /* 按值返回的便捷版本；测试与一次性诊断使用。 */
     [[nodiscard]] state_t get_state() const;
 
-    // 诊断分支，0 正常，1 流非法，2 tick_s 非法，3 tick_s 改变，4 时间倒退，5 dt 非法。
+    // 诊断分支，0 正常，1 流非法，2 tick_s 非法，3 tick_s 改变，4 时间倒退，5 dt 非法，6 超过最大采样间隔。
     inline static volatile uint32_t err_stage = 0U;
 
   private:
@@ -144,8 +148,10 @@ class vqf_eskf_t
         bool acc_rejected = false;
         uint32_t acc_corrections = 0;
         uint32_t acc_rejections = 0;
-        uint8_t consumed_gyr = 0;
-        uint8_t consumed_acc = 0;
+        uint16_t consumed_gyr = 0;
+        uint16_t consumed_acc = 0;
+        uint16_t updated_gyr = 0; ///< 最近一次实际更新时间的样本下标 + 1，0 表示未更新。
+        uint16_t updated_acc = 0;
         sample_clock_t gyr_clock{};
         sample_clock_t acc_clock{};
         float timestamp_tick_s = 0.0f;
