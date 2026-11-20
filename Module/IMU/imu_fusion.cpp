@@ -36,6 +36,10 @@ volatile uint32_t imu_service_algo_rounds     = 0U;
 volatile uint32_t imu_service_vqf_consumed    = 0U;
 volatile uint32_t imu_service_vqf_err         = 0U;
 volatile uint32_t imu_service_vqf_warn        = 0U;
+volatile uint32_t imu_service_vqf_resets      = 0U;
+volatile uint32_t imu_service_reset_reason    = 0U;
+volatile uint32_t imu_service_invalid_frames  = 0U;
+volatile uint32_t imu_service_snapshot_valid  = 0U;
 volatile int32_t  imu_service_vqf_status      = 0;
 volatile uint32_t imu_service_vqf_us_max      = 0U;
 volatile uint32_t imu_service_vqf_us_avg      = 0U;
@@ -91,7 +95,33 @@ struct heading_ref_t
     uint8_t quality = 0U;    /**< 0 未建立 / 1 静止收敛 / 2 超时兜底 */
 };
 heading_ref_t s_heading{};
-uint32_t      s_zero_wait = 0U;
+TickType_t s_heading_started = 0U;
+
+template <typename Sample>
+struct latest_sample_t
+{
+    Sample sample{};
+    TickType_t processed_at = 0U;
+    bool seen = false;
+
+    bool expired(TickType_t now) const
+    {
+        return seen && (now - processed_at >= pdMS_TO_TICKS(config::kSampleStaleMs));
+    }
+};
+
+latest_sample_t<acc_sample_t> s_acc;
+latest_sample_t<gyro_sample_t> s_gyro;
+uint32_t s_discontinuities = 0U;
+
+enum class reset_reason_t : uint32_t
+{
+    capture_loss = 1U,
+    stale,
+    rollback,
+    gap,
+    filter_error
+};
 
 uint32_t s_sequence = 0U;
 
@@ -151,7 +181,8 @@ void update_heading_zero(float yaw_install, bool initialized, bool rest,
     }
     const bool settled = initialized && rest &&
                          (bias_sigma_rps < config::kHeadingBiasSigmaRps);
-    const bool fallback = (++s_zero_wait >= config::kHeadingTimeoutRounds) && initialized;
+    const bool fallback = initialized &&
+        (xTaskGetTickCount() - s_heading_started >= pdMS_TO_TICKS(config::kHeadingTimeoutMs));
     if (settled || fallback)
     {
         s_heading.yaw0    = yaw_install;
@@ -186,145 +217,229 @@ pyro::status_t init()
     }
 
     s_algo_next_1s = static_cast<uint32_t>(xTaskGetTickCount()) + 1000U;
-
-    /* 清一次错误计数：到这里消费侧已就绪，之后再出现的 backpressure / ovr
-     * 才是"稳态是否掉链子"的真实信号。
-     *
-     * 为什么需要这一步：上电时采集任务（HIGH）先于融合任务跑起来，
-     * 而 vqf 的首帧初始化（时间基准建立、倾斜对齐）明显重于稳态，
-     * 期间 64 帧的环形缓冲会被填满并丢弃一批样本。实测每次上电固定
-     * 产生约 88 次 err_backpressure，但此后 261 秒内零增长——
-     * 若不清零，这个固定偏置会让"持续堆积"的判据失效。 */
-    capture::clear_error_counters();
+    s_heading_started = xTaskGetTickCount();
+    s_discontinuities = capture::discontinuities();
     return pyro::PYRO_OK;
 }
+
+namespace
+{
+void reset_fusion(pyro::vqf_eskf_t::state_t &state, reset_reason_t reason)
+{
+    ++imu_service_vqf_resets;
+    imu_service_reset_reason = static_cast<uint32_t>(reason);
+    s_acc.seen = false;
+    s_gyro.seen = false;
+    s_heading = {};
+    s_heading_started = xTaskGetTickCount();
+    pyro::status_t result = s_vqf.reset(state.bias, state.bias_sigma);
+    if (result != pyro::PYRO_OK)
+    {
+        result = s_vqf.reset();
+    }
+    imu_service_vqf_ready = (result == pyro::PYRO_OK) ? 1 : 0;
+    if (result != pyro::PYRO_OK)
+    {
+        imu_service_vqf_status = static_cast<int32_t>(result);
+        ++imu_service_vqf_err;
+    }
+    s_vqf.get_state(state);
+    state.initialized = false;
+}
+
+void publish_snapshot(const pyro::vqf_eskf_t::state_t &state)
+{
+    /* 装配归一化：器件系 → 安装系。
+     * 换系必须在归零之前，因为航向零点是安装系下的产品定义；
+     * 机体系向量（含零偏）都要换，漏一个即与四元数不同系。 */
+    float q[4] = {state.quat[0], state.quat[1], state.quat[2], state.quat[3]};
+    quat_to_install(q, s_m_inv);
+
+    const float *last_acc  = s_acc.sample.Accel;
+    const float *last_gyro = s_gyro.sample.Gyro;
+    float acc_inst[3]  = {last_acc[0], last_acc[1], last_acc[2]};
+    float gyro_inst[3] = {last_gyro[0], last_gyro[1], last_gyro[2]};
+    float bias_inst[3] = {state.bias[0], state.bias[1], state.bias[2]};
+    mount_apply(acc_inst, k_imu_direct);
+    mount_apply(gyro_inst, k_imu_direct);
+    mount_apply(bias_inst, k_imu_direct);
+
+    /* 航向零点：yaw0 取自本拍，因此归零那一拍的输出 yaw 恰为 0 */
+    update_heading_zero(quat_yaw_rad(q), state.initialized, state.rest_detected,
+                        state.bias_sigma);
+    if (s_heading.zeroed)
+    {
+        apply_heading_zero(q, s_heading.yaw0);
+    }
+
+    float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
+    quat_to_euler(q, roll, pitch, yaw);
+
+    /* ---- 组快照（全量 POD，seqlock 发布） ---- */
+    imu_snapshot_t next{};
+    next.sequence     = s_sequence++;
+    next.timestamp_ms = static_cast<uint32_t>(xTaskGetTickCount());
+    for (uint8_t i = 0U; i < 4U; ++i) { next.quat[i] = q[i]; }
+    for (uint8_t i = 0U; i < 3U; ++i)
+    {
+        next.accel[i] = acc_inst[i];
+        next.gyro[i]  = gyro_inst[i];
+        next.bias[i]  = bias_inst[i];
+    }
+    next.euler[0] = roll;
+    next.euler[1] = pitch;
+    next.euler[2] = yaw;
+    next.rest_t   = state.rest_t;
+    next.rest     = state.rest_detected;
+    next.valid    = state.initialized;
+    next.heading_zeroed  = s_heading.zeroed;
+    next.heading_quality = s_heading.quality;
+    next.params   = s_publish_params;
+
+    /* 写侧挂起调度器：更高优先级的读者若读到奇序号会一直空转，
+     * 而写方正是被它抢占的——双方互等。vTaskSuspendAll 只禁止任务切换、
+     * 不屏蔽中断，SPI/DMA 完成照常进 ISR。窗口内只有约 100 字节赋值。 */
+    vTaskSuspendAll();
+    ++s_snapshot_seq; /* 奇数：更新中 */
+    s_snapshot = next;
+    __DMB();
+    ++s_snapshot_seq; /* 偶数：稳定 */
+    (void)xTaskResumeAll();
+
+    imu_service_snapshot_valid = next.valid ? 1U : 0U;
+    if (!next.valid)
+    {
+        ++imu_service_invalid_frames;
+    }
+
+    /* ---- 调试镜像 ---- */
+    float sq = 0.0f;
+    for (uint8_t i = 0U; i < 4U; ++i)
+    {
+        imu_service_quat[i] = q[i];
+        sq += q[i] * q[i];
+    }
+    imu_service_quat_norm = std::sqrt(sq);
+    for (uint8_t i = 0U; i < 3U; ++i)
+    {
+        imu_service_accel_mps2[i] = acc_inst[i];
+        imu_service_gyro_rps[i]   = gyro_inst[i];
+        imu_service_bias_rps[i]   = bias_inst[i];
+    }
+    imu_service_roll  = roll;
+    imu_service_pitch = pitch;
+    imu_service_yaw   = yaw;
+    imu_service_rest  = state.rest_detected ? 1U : 0U;
+    imu_service_rest_t = state.rest_t;
+    for (uint8_t i = 0U; i < 3U; ++i)
+    {
+        imu_service_rest_gyr_lp[i] = state.rest_gyr_lp[i];
+        imu_service_rest_acc_lp[i] = state.rest_acc_lp[i];
+    }
+    imu_service_heading_zeroed  = s_heading.zeroed ? 1U : 0U;
+    imu_service_heading_quality = s_heading.quality;
+    imu_service_acc_confidence  = state.acc_confidence;
+    imu_service_acc_nis         = state.acc_nis;
+    imu_service_acc_rejected    = state.acc_rejected ? 1U : 0U;
+}
+
+bool process_batch()
+{
+    imu_data_t batch{};
+    uint32_t discontinuities;
+    // 固定两路 tail 和丢失代次。释放 head 前生产者不能覆盖本批的槽。
+    vTaskSuspendAll();
+    const imu_data_t &live = capture::data();
+    batch.gyro = live.gyro;
+    batch.acc = live.acc;
+    batch.timestamp_tick_s = live.timestamp_tick_s;
+    discontinuities = capture::discontinuities();
+    (void)xTaskResumeAll();
+
+    const uint16_t gyro_count = batch.gyro.available();
+    const uint16_t acc_count = batch.acc.available();
+    const TickType_t now = xTaskGetTickCount();
+    const bool loss = discontinuities != s_discontinuities;
+    s_discontinuities = discontinuities;
+    const bool stale = s_gyro.expired(now) || s_acc.expired(now);
+    if (!loss && !stale && (gyro_count == 0U && acc_count == 0U))
+    {
+        return false;
+    }
+
+    pyro::vqf_eskf_t::state_t state;
+    if (loss || stale)
+    {
+        capture::release_consumed(gyro_count, acc_count);
+        s_vqf.get_state(state);
+        reset_fusion(state, loss ? reset_reason_t::capture_loss : reset_reason_t::stale);
+    }
+    else if (imu_service_vqf_ready)
+    {
+        const uint32_t t0 = pyro::dwt_drv_t::get_current_ticks();
+        const pyro::status_t result = s_vqf.update(batch);
+        const uint32_t us = (pyro::dwt_drv_t::get_current_ticks() - t0) / config::kCpuMhz;
+        if (us > s_us_max) { s_us_max = us; }
+        s_us_sum += us;
+        ++s_win_round;
+        imu_service_vqf_status = static_cast<int32_t>(result);
+        s_vqf.get_state(state);
+        imu_service_vqf_consumed += static_cast<uint32_t>(state.consumed_gyr) + state.consumed_acc;
+        if (result == pyro::PYRO_OK || result == pyro::PYRO_WARNING)
+        {
+            if (result == pyro::PYRO_WARNING) { ++imu_service_vqf_warn; }
+            if (state.updated_gyr != 0U)
+            {
+                s_gyro = {batch.gyro.at(state.updated_gyr - 1U), now, true};
+            }
+            if (state.updated_acc != 0U)
+            {
+                s_acc = {batch.acc.at(state.updated_acc - 1U), now, true};
+            }
+            capture::release_consumed(state.consumed_gyr, state.consumed_acc);
+            if (s_gyro.seen && s_acc.seen && (state.updated_gyr != 0U || state.updated_acc != 0U))
+            {
+                publish_snapshot(state);
+                return true;
+            }
+            return false;
+        }
+
+        ++imu_service_vqf_err;
+        const uint32_t stage = pyro::vqf_eskf_t::err_stage;
+        if (stage == 4U || stage == 6U)
+        {
+            // 倒退帧已隔离。长间隔后的首帧留给新时间基准。
+            capture::release_consumed(state.consumed_gyr, state.consumed_acc);
+            reset_fusion(state, stage == 4U ? reset_reason_t::rollback : reset_reason_t::gap);
+        }
+        else
+        {
+            capture::release_consumed(gyro_count, acc_count);
+            reset_fusion(state, reset_reason_t::filter_error);
+        }
+    }
+    else
+    {
+        capture::release_consumed(gyro_count, acc_count);
+        return false;
+    }
+
+    // 有效 → 无效时发送一次零四元数，随后等待真实的新样本。
+    if (s_snapshot.valid)
+    {
+        publish_snapshot(state);
+        return true;
+    }
+    return false;
+}
+} // namespace
 
 bool fuse_once()
 {
     const uint32_t t_loop0 = pyro::dwt_drv_t::get_current_ticks();
-    bool fused = false;
-
-    {
-        /* 本任务【只消费】环形缓冲：SPSC 保证生产者（采集任务）只移动 tail、
-         * 本任务只移动 head，因此 at(i) 读到的一定是完整样本，无需临界区。 */
-        imu_data_t &d = capture::data();
-        const uint32_t t0 = pyro::dwt_drv_t::get_current_ticks();
-        const pyro::status_t st = s_vqf.update(d);
-        const uint32_t us = static_cast<uint32_t>(
-            (pyro::dwt_drv_t::get_current_ticks() - t0) / config::kCpuMhz);
-        if (us > s_us_max) { s_us_max = us; }
-        s_us_sum += us;
-        ++s_win_round;
-
-        imu_service_vqf_status = static_cast<int32_t>(st);
-        if (st == pyro::PYRO_WARNING)
-        {
-            ++imu_service_vqf_warn;   /* 单帧异常但已跳过，继续 */
-        }
-        else if (st != pyro::PYRO_OK)
-        {
-            ++imu_service_vqf_err;    /* 参数非法，本批提前结束 */
-        }
-
-        pyro::vqf_eskf_t::state_t state;
-        s_vqf.get_state(state);
-
-        /* 按算法实际消费量归还环形缓冲：
-         * ERROR 时未消费的样本留在环里，下一拍继续，不重复也不丢。
-         * 归还是驱动的责任（head 的所有权在消费者侧），因此走 capture 的接口。 */
-        capture::release_consumed(state.consumed_gyr, state.consumed_acc);
-        imu_service_vqf_consumed +=
-            static_cast<uint32_t>(state.consumed_gyr) + state.consumed_acc;
-        ++imu_service_algo_rounds;
-
-        /* 装配归一化：器件系 → 安装系。
-         * 换系必须在归零之前，因为航向零点是安装系下的产品定义；
-         * 机体系向量（含零偏）都要换，漏一个即与四元数不同系。 */
-        float q[4] = {state.quat[0], state.quat[1], state.quat[2], state.quat[3]};
-        quat_to_install(q, s_m_inv);
-
-        const float *last_acc  = capture::last_acc_dev();
-        const float *last_gyro = capture::last_gyro_dev();
-        float acc_inst[3]  = {last_acc[0], last_acc[1], last_acc[2]};
-        float gyro_inst[3] = {last_gyro[0], last_gyro[1], last_gyro[2]};
-        float bias_inst[3] = {state.bias[0], state.bias[1], state.bias[2]};
-        mount_apply(acc_inst, k_imu_direct);
-        mount_apply(gyro_inst, k_imu_direct);
-        mount_apply(bias_inst, k_imu_direct);
-
-        /* 航向零点：yaw0 取自本拍，因此归零那一拍的输出 yaw 恰为 0 */
-        update_heading_zero(quat_yaw_rad(q), state.initialized, state.rest_detected,
-                            state.bias_sigma);
-        if (s_heading.zeroed)
-        {
-            apply_heading_zero(q, s_heading.yaw0);
-        }
-
-        float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
-        quat_to_euler(q, roll, pitch, yaw);
-
-        /* ---- 组快照（全量 POD，seqlock 发布） ---- */
-        imu_snapshot_t next{};
-        next.sequence     = s_sequence++;
-        next.timestamp_ms = static_cast<uint32_t>(xTaskGetTickCount());
-        for (uint8_t i = 0U; i < 4U; ++i) { next.quat[i] = q[i]; }
-        for (uint8_t i = 0U; i < 3U; ++i)
-        {
-            next.accel[i] = acc_inst[i];
-            next.gyro[i]  = gyro_inst[i];
-            next.bias[i]  = bias_inst[i];
-        }
-        next.euler[0] = roll;
-        next.euler[1] = pitch;
-        next.euler[2] = yaw;
-        next.rest_t   = state.rest_t;
-        next.rest     = state.rest_detected;
-        next.valid    = state.initialized;
-        next.heading_zeroed  = s_heading.zeroed;
-        next.heading_quality = s_heading.quality;
-        next.params   = s_publish_params;
-
-        /* 写侧挂起调度器：更高优先级的读者若读到奇序号会一直空转，
-         * 而写方正是被它抢占的——双方互等。vTaskSuspendAll 只禁止任务切换、
-         * 不屏蔽中断，SPI/DMA 完成照常进 ISR。窗口内只有约 100 字节赋值。 */
-        vTaskSuspendAll();
-        ++s_snapshot_seq; /* 奇数：更新中 */
-        s_snapshot = next;
-        __DMB();
-        ++s_snapshot_seq; /* 偶数：稳定 */
-        (void)xTaskResumeAll();
-        fused = true;     /* 新快照已就绪，调用方据此唤醒发布任务 */
-
-        /* ---- 调试镜像 ---- */
-        float sq = 0.0f;
-        for (uint8_t i = 0U; i < 4U; ++i)
-        {
-            imu_service_quat[i] = q[i];
-            sq += q[i] * q[i];
-        }
-        imu_service_quat_norm = std::sqrt(sq);
-        for (uint8_t i = 0U; i < 3U; ++i)
-        {
-            imu_service_accel_mps2[i] = acc_inst[i];
-            imu_service_gyro_rps[i]   = gyro_inst[i];
-            imu_service_bias_rps[i]   = bias_inst[i];
-        }
-        imu_service_roll  = roll;
-        imu_service_pitch = pitch;
-        imu_service_yaw   = yaw;
-        imu_service_rest  = state.rest_detected ? 1U : 0U;
-        imu_service_rest_t = state.rest_t;
-        for (uint8_t i = 0U; i < 3U; ++i)
-        {
-            imu_service_rest_gyr_lp[i] = state.rest_gyr_lp[i];
-            imu_service_rest_acc_lp[i] = state.rest_acc_lp[i];
-        }
-        imu_service_heading_zeroed  = s_heading.zeroed ? 1U : 0U;
-        imu_service_heading_quality = s_heading.quality;
-        imu_service_acc_confidence  = state.acc_confidence;
-        imu_service_acc_nis         = state.acc_nis;
-        imu_service_acc_rejected    = state.acc_rejected ? 1U : 0U;
-    }
+    const bool fused = process_batch();
+    ++imu_service_algo_rounds;
 
     /* 1 秒窗口统计：融合单批与整拍耗时（采集侧另有一套） */
     s_loop_sum += static_cast<uint32_t>(

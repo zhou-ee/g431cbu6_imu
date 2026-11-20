@@ -63,7 +63,7 @@ pyro::status_t init();
 
 /** 融合一拍：消费 SPSC 环形缓冲 → update → 归一化 → 归零 → 快照。
  *  @retval true  本次产出了新快照（调用方据此唤醒发布任务）
- *  @retval false 本拍无新样本可消费，快照未更新 */
+ *  @retval false 没有新测量或有效性变化，快照未更新 */
 bool fuse_once();
 
 /** 取一次完整快照（seqlock，跨字段同拍）。
@@ -81,6 +81,10 @@ extern volatile int32_t  imu_service_vqf_ready;       /* 1=算法配置成功 */
 extern volatile uint32_t imu_service_algo_rounds;     /* 融合轮数 */
 extern volatile uint32_t imu_service_vqf_consumed;    /* 累计消费样本数（两路） */
 extern volatile uint32_t imu_service_vqf_err;         /* 算法 ERROR 次数 */
+extern volatile uint32_t imu_service_vqf_resets;      /* 融合恢复次数 */
+extern volatile uint32_t imu_service_reset_reason;    /* 1 丢样 / 2 陈旧 / 3 倒退 / 4 长间隔 / 5 算法错误 */
+extern volatile uint32_t imu_service_invalid_frames;  /* 生成的无效姿态快照数 */
+extern volatile uint32_t imu_service_snapshot_valid;
 extern volatile uint32_t imu_service_vqf_warn;        /* 算法 WARNING 次数 */
 extern volatile int32_t  imu_service_vqf_status;      /* 最近一次 update 返回值 */
 extern volatile uint32_t imu_service_vqf_us_max;      /* 单批融合峰值耗时，µs */
