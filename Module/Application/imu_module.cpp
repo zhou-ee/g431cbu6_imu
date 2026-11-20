@@ -54,6 +54,7 @@ namespace
  * 二值信号量的语义在这里正好：积压没有意义，只要"有新数据"这一个事实。 */
 SemaphoreHandle_t s_cap_sem  = nullptr;
 SemaphoreHandle_t s_algo_sem = nullptr;
+bool s_ins_started = false;
 
 /* ======================= 采集任务 =======================
  * 1 ms 固定周期驱动 read()。挂起在 DMA 完成信号量上，不占 CPU。
@@ -77,7 +78,7 @@ class cap_task_t final : public pyro::task_base_t
         {
             capture::capture_once();
             (void)xSemaphoreGive(s_cap_sem);
-            vTaskDelayUntil(&wake, config::kPublishPeriodMs);
+            vTaskDelayUntil(&wake, pdMS_TO_TICKS(config::kPublishPeriodMs));
         }
     }
 };
@@ -103,10 +104,8 @@ class algo_task_t final : public pyro::task_base_t
     {
         for (;;)
         {
-            if (xSemaphoreTake(s_cap_sem, portMAX_DELAY) != pdTRUE)
-            {
-                continue;
-            }
+            // 即使采集任务没有唤醒，也定期检查样本是否过期。
+            (void)xSemaphoreTake(s_cap_sem, pdMS_TO_TICKS(config::kSampleStaleMs));
             if (fusion::fuse_once())
             {
                 /* 只在真正产出新快照时唤醒发布，避免发布任务被空拍唤醒 */
@@ -120,6 +119,58 @@ class algo_task_t final : public pyro::task_base_t
 cap_task_t  s_cap_task;
 algo_task_t s_algo_task;
 
+void delete_startup_semaphores()
+{
+    if (s_cap_sem != nullptr)
+    {
+        vSemaphoreDelete(s_cap_sem);
+        s_cap_sem = nullptr;
+    }
+    if (s_algo_sem != nullptr)
+    {
+        vSemaphoreDelete(s_algo_sem);
+        s_algo_sem = nullptr;
+    }
+}
+
+int start_ins()
+{
+    const pyro::status_t ins = capture::init();
+    if (ins != pyro::PYRO_OK && ins != pyro::PYRO_ALREADY_INIT)
+    {
+        return ins == pyro::PYRO_NO_MEMORY ? -2 : (ins == pyro::PYRO_PARAM_ERROR ? -3 : -1);
+    }
+    const pyro::status_t fus = fusion::init();
+    if (fus != pyro::PYRO_OK)
+    {
+        return fus == pyro::PYRO_PARAM_ERROR ? -3 : -1;
+    }
+
+    s_cap_sem = xSemaphoreCreateBinary();
+    s_algo_sem = xSemaphoreCreateBinary();
+    if (s_cap_sem == nullptr || s_algo_sem == nullptr)
+    {
+        delete_startup_semaphores();
+        return -2;
+    }
+    // 先启动等待信号量的融合任务，再启动会占用 SPI 的采集任务。
+    const pyro::status_t algo = s_algo_task.start();
+    if (algo != pyro::PYRO_OK)
+    {
+        delete_startup_semaphores();
+        return algo == pyro::PYRO_NO_MEMORY ? -2 : -1;
+    }
+    const pyro::status_t cap = s_cap_task.start();
+    if (cap != pyro::PYRO_OK)
+    {
+        s_algo_task.stop();
+        delete_startup_semaphores();
+        return cap == pyro::PYRO_NO_MEMORY ? -2 : -1;
+    }
+    s_ins_started = true;
+    return 0;
+}
+
 } // namespace
 } // namespace imu_module
 
@@ -132,56 +183,14 @@ extern "C" int imu_module_init(void)
         return 0;
     }
 
-    /* ① 器件初始化 + 算法配置（在调用者上下文同步完成） */
-    const pyro::status_t ins = capture::init();
-    switch (ins)
+    if (!s_ins_started)
     {
-        case pyro::PYRO_OK:
-        case pyro::PYRO_ALREADY_INIT:
-            break;
-        case pyro::PYRO_NO_MEMORY:
-            imu_module_init_result = -2;
-            return imu_module_init_result;
-        case pyro::PYRO_PARAM_ERROR:
-            imu_module_init_result = -3;
-            return imu_module_init_result;
-        default:
-            imu_module_init_result = -1;
-            return imu_module_init_result;
-    }
-
-    /* ② 信号量：先于任务创建，任务一跑起来就能拿到它们 */
-    s_cap_sem  = xSemaphoreCreateBinary();
-    s_algo_sem = xSemaphoreCreateBinary();
-    if (s_cap_sem == nullptr || s_algo_sem == nullptr)
-    {
-        imu_module_init_result = -2;
-        return imu_module_init_result;
-    }
-
-    /* ③ 采集 + 融合。采集先起：它是一切数据的源头 */
-    const pyro::status_t cap = s_cap_task.start();
-    if (cap != pyro::PYRO_OK)
-    {
-        imu_module_init_result = (cap == pyro::PYRO_NO_MEMORY) ? -2 : -1;
-        return imu_module_init_result;
-    }
-    const pyro::status_t algo = s_algo_task.start();
-    if (algo != pyro::PYRO_OK)
-    {
-        imu_module_init_result = (algo == pyro::PYRO_NO_MEMORY) ? -2 : -1;
-        return imu_module_init_result;
-    }
-
-    imu_service_heap_free_min = static_cast<uint32_t>(xPortGetFreeHeapSize());
-
-    /* ③.5 融合侧配置：装配参数要读采集侧的解包参数与零偏，
-     *      因此必须放在 capture::init() 之后。 */
-    const pyro::status_t fus = fusion::init();
-    if (fus != pyro::PYRO_OK)
-    {
-        imu_module_init_result = (fus == pyro::PYRO_PARAM_ERROR) ? -3 : -1;
-        return imu_module_init_result;
+        const int ret = start_ins();
+        if (ret != 0)
+        {
+            imu_module_init_result = ret;
+            return ret;
+        }
     }
 
     /* ④ 发布任务：拿到 s_algo_sem 才算建立完整链路。
@@ -194,6 +203,7 @@ extern "C" int imu_module_init(void)
         return imu_module_init_result;
     }
 
+    imu_service_heap_free_min = static_cast<uint32_t>(xPortGetMinimumEverFreeHeapSize());
     imu_module_init_result = 0;
     return imu_module_init_result;
 }
