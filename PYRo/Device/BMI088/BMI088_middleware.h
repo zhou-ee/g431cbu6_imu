@@ -28,7 +28,7 @@ class bmi088_t
     virtual bool read_regs_collect(uint8_t *, uint16_t) { return false; }
 };
 
-// BMI088 的 SPI 适配。每个实例从 DMA 堆分配自己的收发缓冲。
+// BMI088 的 SPI 适配。收发缓冲内嵌在对象中，不走 DMA 堆。
 class bmi088_spi_t final : public bmi088_t
 {
   public:
@@ -64,10 +64,8 @@ class bmi088_spi_t final : public bmi088_t
     // 收发缓冲直接放在对象内（.bss），不再从 DMA 堆分配：
     // H7 上 DTCM 不能被 DMA 访问，故上游必须用专用堆避开；
     // G4 全部 SRAM 均可被 DMA 访问，类成员地址天然可用。
-    uint8_t _tx_buffer[dma_buffer_size]{};
-    uint8_t _rx_buffer[dma_buffer_size]{};
-    uint8_t *const _tx = _tx_buffer;
-    uint8_t *const _rx = _rx_buffer;
+    uint8_t _tx[dma_buffer_size]{};
+    uint8_t _rx[dma_buffer_size]{};
 
     enum class dma_state_t : uint8_t { idle, in_flight, ready };
     struct
