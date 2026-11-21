@@ -2,16 +2,8 @@
  * @file    imu_capture.h
  * @brief   采集侧：器件总线绑定 + read() 一拍 + 采样统计。
  *
- * ============================ 职责边界 ============================
- * 本模块只负责"把器件里的原始数据搬到软件环形缓冲"，不碰任何算法状态：
- *   · 持有 SPI 总线对象与 LSM6DSV16x 驱动实例（唯一的硬件入口）
- *   · capture_once()：FIFO 状态 → 等 DMA → 读数据 → TAG 解包 → SPSC publish
- *   · 记录采集侧耗时与错误计数（1 s 窗口）
- *
- * 输出是【器件坐标系】的物理量（单位换算 + 扣静态偏置），
- * 装配方向映射与融合都在 fusion 侧完成——驱动不感知产品如何安装。
- *
- * 由 imu_module.cpp 的 ins_cap 任务每 1 ms 调用 capture_once()。
+ * 只负责把器件原始数据搬进软件环形缓冲，不碰算法状态。
+ * 输出为器件坐标系物理量；装配映射与融合在 fusion 侧完成。
  */
 
 #ifndef IMU_MODULE_IMU_IMU_CAPTURE_H
@@ -26,21 +18,19 @@ namespace capture
 {
 
 /** 总线与器件初始化（WHO_AM_I 自检、软复位、量程/ODR、FIFO、时间戳）。
- *  仅可在调度器启动后的任务上下文调用（read 内部要等 DMA 完成信号量）。
- *  @retval PYRO_OK    成功
- *  @retval PYRO_ERROR 器件自检或配置失败 */
+ *  仅可在调度器启动后的任务上下文调用（read 内部要等 DMA 完成信号量）。 */
 pyro::status_t init();
 
-/** 采集一拍：read() + 诊断计数 + 1 s 窗口统计。
- *  内部两段 DMA 等待会挂起任务，不占 CPU。 */
+/** 采集一拍：read() + 诊断计数 + 1 s 窗口统计。等待期间任务挂起，不占 CPU。 */
 void capture_once();
 
-/** 驱动数据视图（供 fusion 侧读取环形缓冲与解包参数）。
- *  返回引用是安全的：驱动实例生命周期与程序相同，且只有 fusion 侧在读。 */
+/** 驱动数据视图（供 fusion 读取环形缓冲与解包参数）。 */
 imu_data_t &data();
 
-/** 归还已消费的样本数（只前移 head，O(1)，不搬数据）。
- *  head 的所有权在消费者侧，但实际存储属于驱动，因此由本模块代理。 */
+/** 采集数据中断代次，与两路环形索引在同一调度器挂起窗口内读取。 */
+uint32_t discontinuities();
+
+/** 归还已消费的样本数（只前移 head，O(1)）。 */
 void release_consumed(uint16_t gyro_count, uint16_t acc_count);
 
 /** 采集侧耗时（1 s 窗口）与轮次。 */
@@ -52,9 +42,8 @@ uint32_t cap_stack_free();
 } // namespace capture
 } // namespace imu_module
 
-/* ============================ 调试观察量 ============================
- * 定义在本模块的 .cpp。必须放全局作用域（extern "C"），否则 ELF 里的 C 链接
- * 裸名字与调试器按命名空间查找的名字对不上，gdb 会报 Missing ELF symbol。 */
+/* 调试观察量：必须放全局作用域（extern "C"），否则调试器按命名空间查找
+ * 时对不上 ELF 里的裸名字。定义在本模块的 .cpp。 */
 extern "C" {
 extern volatile uint32_t imu_service_read_ok;        /* read() 返回 true 的次数 */
 extern volatile uint32_t imu_service_cap_rounds;     /* 采集轮次（1 kHz 硬周期） */

@@ -86,8 +86,7 @@ public:
     bool read_regs_collect(uint8_t *buf, uint16_t len) override;
     bool wait_dma(uint32_t timeout_ms) override;
 private:
-    /* 总线驱动引用（不持有）：由 bsp_spi 管理生命周期，同一总线多从机共享。
-     * 设备层只通过它访问总线，不再保存 SPI_HandleTypeDef 副本。 */
+    /* 总线驱动引用（不持有）：由 bsp_spi 管理，同总线多从机共享。 */
     pyro::spi_drv_t &_spi_drv;
 
     GPIO_TypeDef *_cs_port;
@@ -96,43 +95,33 @@ private:
     /* FIFO DMA 开关（构造时指定）。 */
     bool _dma_enable;
 
-    /* 大读双缓冲槽下标（0/1 交替）：本次 DMA 写入 _slot，另一槽 (_slot^1) 里
-     * 保存着上一次大读的结果 = 上一帧，交付完才轮到它做下一笔的目标。
-     * 单个下标即可表达两槽含义，无需再记"上一个槽"。
-     * 注意：本类不可重入（单总线串行访问），无需保护。 */
+    /* 大读双缓冲槽下标（0/1 交替）：本次 DMA 写入 _slot，另一槽保存上一帧，
+     * 交付完才轮到它做下一笔的目标。本类不可重入，无需保护。 */
     uint8_t _slot{};
 
-    /* 尚待交付的 FIFO DMA 字节数（不含地址字节），完整交付后清零。 */
+    /* 尚待交付的 FIFO DMA 字节数（不含地址字节）。 */
     uint16_t _prev_len{};
 
-    /* 小读（≤ LSM6DSV16X_SYNC_READ_MAX 字节）专用暂存：容量刚好装下地址字节 + 数据。
-     * 独立于 _tx/_rx，保证阻塞小读不会踩到在途的大读 DMA（小读每周期都发生，
-     * 若共用大读的双缓冲会立刻打乱其交替次序）。写事务也用这块。
-     * 异步小读（read_regs_request/collect）同样借用这块：同一时刻只有一笔小读在途。 */
+    /* 小读（≤ LSM6DSV16X_SYNC_READ_MAX）专用暂存，含地址字节。
+     * 独立于 _tx/_rx，避免阻塞小读打乱大读的双槽交替；写事务与异步小读
+     * 也借用这块（同一时刻只有一笔小读在途）。 */
     uint8_t _sm_tx[LSM6DSV16X_SYNC_READ_MAX + 1U]{};
     uint8_t _sm_rx[LSM6DSV16X_SYNC_READ_MAX + 1U]{};
 
-    /* 在途异步小读的数据长度（不含地址字节），0 表示没有在途小读。 */
+    /* 在途异步小读的数据长度（不含地址字节），0 表示无。 */
     uint16_t _sm_len{};
 
-    /* 发起至 wait_dma 完成期间持有总线。完成结果由本设备保存到收取为止。 */
+    /* 发起至 wait_dma 完成期间持有总线；完成结果由本设备保存到收取为止。 */
     bool _holding_bus{false};
     bool _result_ready{false};
 
-    /* 幂等的总线获取/释放：内部维护 _holding_bus，重复调用安全。
-     * bus_acquire 在总线被占用时【挂起等待】，而不是立即失败。 */
+    /* 幂等的总线获取/释放；bus_acquire 在总线被占用时挂起等待。 */
     pyro::status_t bus_acquire(uint32_t timeout_ms);
     void           bus_release();
 
-    /* 大读的收发暂存（随对象静态生命周期，不进调用者栈，支撑 FIFO 大批量读）。
-     * 维度是 [槽][字节]：外层 2 个槽，内层每槽 LSM6DSV16X_MAX_BURST+1 字节，
-     * 两槽在内存里彼此独立、互不重叠——这是"一笔 DMA 在途时另一槽可安全交付
-     * 上一帧"的前提（原来的 [MAX+1][2] 实际是 257 个 2 字节槽，
-     * 写满 len+1 字节会越界踩到相邻成员）。
-     * 槽内容：
-     *   _tx[slot]：地址字节 + 全 0（读阶段 MOSI 内容无关，MISO 有效）；
-     *   _rx[slot]：第 0 字节是地址阶段的 MISO 残留，数据从 [1] 起。
-     * 注意：本类不可重入——本器件单总线 + 软 CS，只允许任务上下文串行访问。 */
+    /* 大读收发暂存，维度 [槽][字节]，两槽互不重叠——这是"一笔 DMA 在途时
+     * 另一槽可安全交付上一帧"的前提。_tx 为地址字节 + 全 0；
+     * _rx 第 0 字节是地址阶段残留，数据从 [1] 起。 */
     uint8_t _tx[2][LSM6DSV16X_MAX_BURST + 1U]{};
     uint8_t _rx[2][LSM6DSV16X_MAX_BURST + 1U]{};
 
@@ -140,13 +129,10 @@ private:
 
     void cs_high() const;
 
-    /* 发起一笔 DMA 事务：每笔事务前绑定完成钩子（单槽，多从机共享）→
-     * 拉低 CS → 发起。调用方须已确认总线可用。 */
+    /* 拉低 CS 并发起 DMA。调用方须已持有总线（完成钩子已在那一步绑定）。 */
     pyro::status_t dma_start(const uint8_t *tx, uint8_t *rx, uint16_t size);
 
-    /* DMA 完成钩子（ISR 上下文）：在数据搬运完成点释放 CS，
-     * 而非等任务唤醒——CS 低电平尾部最短，且时序不依赖阻塞等待前提。
-     * 每笔事务发起前经 spi_drv_t::set_cplt_hook 绑定到本对象。 */
+    /* DMA 完成钩子（ISR）：在数据搬运完成点拉高 CS。 */
     static void release_cs_from_isr(void *ctx);
 };
 
