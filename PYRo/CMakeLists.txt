@@ -54,6 +54,8 @@ target_sources(PYRo PRIVATE
         Component/IMU/imu_base_drv.cpp
         Component/IMU/lsm6dsv16x/lsm6dsv16x_drv.cpp
         Device/lsm6dsv16x_middleware.cpp
+        Component/IMU/BMI088/BMI088_driver.cpp
+        Device/BMI088/BMI088_middleware.cpp
 )
 
 target_include_directories(PYRo PUBLIC
@@ -80,7 +82,9 @@ target_include_directories(PYRo PUBLIC
 
         Component/IMU
         Component/IMU/lsm6dsv16x
+        Component/IMU/BMI088
         Device
+        Device/BMI088
 )
 
 # 依赖 CubeMX 生成的接口库（提供 HAL、FreeRTOS、CMSIS 的头文件路径与芯片宏）
