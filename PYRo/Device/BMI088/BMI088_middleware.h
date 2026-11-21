@@ -60,8 +60,14 @@ class bmi088_spi_t final : public bmi088_t
     pyro::spi_drv_t &_bus;
     chip_select_t _accel_cs;
     chip_select_t _gyro_cs;
-    uint8_t *const _tx;
-    uint8_t *const _rx;
+
+    // 收发缓冲直接放在对象内（.bss），不再从 DMA 堆分配：
+    // H7 上 DTCM 不能被 DMA 访问，故上游必须用专用堆避开；
+    // G4 全部 SRAM 均可被 DMA 访问，类成员地址天然可用。
+    uint8_t _tx_buffer[dma_buffer_size]{};
+    uint8_t _rx_buffer[dma_buffer_size]{};
+    uint8_t *const _tx = _tx_buffer;
+    uint8_t *const _rx = _rx_buffer;
 
     enum class dma_state_t : uint8_t { idle, in_flight, ready };
     struct
