@@ -61,9 +61,6 @@ class bmi088_spi_t final : public bmi088_t
     chip_select_t _accel_cs;
     chip_select_t _gyro_cs;
 
-    // 收发缓冲直接放在对象内（.bss），不再从 DMA 堆分配：
-    // H7 上 DTCM 不能被 DMA 访问，故上游必须用专用堆避开；
-    // G4 全部 SRAM 均可被 DMA 访问，类成员地址天然可用。
     uint8_t _tx[dma_buffer_size]{};
     uint8_t _rx[dma_buffer_size]{};
 
