@@ -1,14 +1,12 @@
 /**
  * @file pyro_spi_drv.cpp
- * @brief Implementation file for the PYRO SPI driver.
- * PYRo SPI 驱动实现文件。
+ * @brief PYRo SPI 总线驱动实现。
  *
- * 结构仿 pyro_uart_drv.cpp：类实现 + 文件尾部的 HAL 弱回调覆盖。
- * 阻塞路径直接映射 HAL 返回值；DMA 路径"发起 + 等二值信号量"，
- * 完成/错误经弱回调（TxCplt / TxRxCplt / Error）在 ISR 中给信号量。
+ * 阻塞路径直接映射 HAL 返回值；DMA 路径「发起 + 等二值信号量」，
+ * 完成/错误经文件尾部的 HAL 弱回调在 ISR 中给信号量。
  *
- * @version 1.0.0
- * @date 2026-11-13
+ * @version 2.0.0
+ * @date 2026-11-20
  */
 
 /* Includes ------------------------------------------------------------------*/
@@ -22,36 +20,25 @@ namespace pyro
 spi_drv_t::spi_drv_t(SPI_HandleTypeDef *hspi) : _hspi(hspi), _err(HAL_SPI_ERROR_NONE)
 {
     _done = xSemaphoreCreateBinary();
-    /* 移植补充：堆不足时不再 configASSERT 死循环（那会把故障点埋进中断里，
-     * 只能靠 halt + 反汇编才能定位）。改为置 state.error 并把 busy 置位，
-     * 后续 tx_dma/txrx_dma 会因 _done==nullptr 直接返回 PYRO_ERROR，
-     * 故障可从驱动层观察到，不会卡住整个系统。 */
+    /* 堆不足时不 configASSERT 死循环——那会把故障点埋进中断里。
+     * 改为置 state.error 并跳过注册，后续调用拿到 PYRO_ERROR。 */
     if (_done == nullptr)
     {
         state.error = 0x01U;
-        return; /* 不注册到 spi_map()：该实例不可用，调用方拿到 PYRO_ERROR */
+        return; /* 不注册：该实例不可用 */
     }
 
-    /* 总线互斥量：多从机时串行化各设备的访问，并保证 _done 上
-     * 同一时刻只有一个等待者（二值信号量只能唤醒一个任务）。
-     * configUSE_MUTEXES = 1 已确认开启，带优先级继承。 */
+    /* 总线互斥量：串行化多从机访问，并保证 _done 上同一时刻只有一个等待者
+     * （二值信号量只能唤醒一个任务）。带优先级继承。 */
     _bus_mutex = xSemaphoreCreateMutex();
     if (_bus_mutex == nullptr)
     {
         /* 退化为「无总线仲裁」：单设备仍可工作，多设备并发会出错。
-         * 不阻止注册——lock()/unlock() 会因句柄为空返回 PYRO_ERROR，
-         * 调用方据此可观察到故障。 */
+         * 不阻止注册，acquire_bus 会因句柄为空返回 PYRO_ERROR。 */
         state.error = 0x01U;
     }
 
-    /* 无条件注册：构造函数已私有，外部只能经 bsp_spi 拿到唯一实例，
-     * 因此这里不存在「同句柄重复注册」的可能。
-     *
-     * 原实现是「if (!spi_map().exist(hspi)) 才注册」，那会把重复构造的
-     * 编程错误静默吞掉（第二个实例照常构造成功、却永远收不到完成通知）。
-     * 更糟的是它在多从机场景下必然触发——多个设备共用同一句柄时，
-     * 第二个实例会被无声丢弃。此后重复构造由「构造函数私有」在编译期拦住，
-     * 这里不需要再做运行时防重。 */
+    /* 无条件注册：构造函数私有，不存在同句柄重复注册的可能。 */
     spi_map()[hspi] = this;
 }
 
@@ -357,14 +344,10 @@ void spi_drv_t::notify_from_isr()
 } // namespace pyro
 
 /* External HAL/ISR Callbacks ------------------------------------------------*/
-/* HAL 弱回调覆盖（USE_HAL_SPI_REGISTER_CALLBACKS = 0，RegisterCallback API 不可用）。
- * 三条路径都收敛到 notify_from_isr()：
- *   - 全双工收发（HAL_SPI_TransmitReceive_DMA）→ TxRxCplt（RX 通道 TC 驱动）
- *   - 仅发送（HAL_SPI_Transmit_DMA）           → TxCplt
- *   - DMA / SPI 错误                           → ErrorCallback（HAL 已中止 DMA）
- * 错误路径也必须通知：否则等待任务要干等满超时。
- * DMA1_Channel1/2 与 SPI1_IRQn 优先级均为 5，等于 configMAX_SYSCALL_INTERRUPT_PRIORITY
- * （5<<4=0x50），FromISR API 合法（FreeRTOS 要求 NVIC 优先级数值 >= 该值）。 */
+/* HAL 弱回调覆盖（USE_HAL_SPI_REGISTER_CALLBACKS = 0，RegisterCallback 不可用）。
+ * 三条路径（TxRxCplt / TxCplt / Error）都收敛到 notify_from_isr()；
+ * 错误路径也必须通知，否则等待任务要干等满超时。
+ * 相关 NVIC 优先级均为 5 = configMAX_SYSCALL_INTERRUPT_PRIORITY，FromISR 合法。 */
 
 namespace
 {
