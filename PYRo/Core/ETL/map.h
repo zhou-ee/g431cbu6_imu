@@ -5,19 +5,19 @@
 namespace pyro
 {
 /**
- * @brief 轻量线性映射表（定容、无动态分配）。
+ * @brief 轻量线性映射表（定容、无动态分配、ISR 只读）。
  *
- * 移植加固说明（相对上游的修改，均带“移植”注释）：
+ * 相对上游的加固（每处均有"移植"注释）：
  *   1. `_size` 类内初始化为 0（上游未初始化，非静态存储期对象上是 UB）；
- *   2. `erase()` 只在找到键时才移动元素并递减计数（上游未命中也会递减，会挤掉表尾有效项）；
- *   3. `operator[]` 增加容量检查，满了返回哨兵并可通过 `full()` 查询，不再越界写；
- *   4. 存储改用 C 数组：上游的 `std::array::operator[]` 会实例化 libstdc++ 的
- *      `__glibcxx_assert` → `fprintf` + `abort` 路径，把 newlib stdio/malloc 一并链进固件
- *      （实测 Debug 构建约 4.9KB Flash），而该断言在本表的 ISR 调用点上是可达的；
- *   5. 构造函数/析构函数改为 `= default`：上游的空用户析构函数会让函数内静态对象
- *      需要 `__cxa_atexit` 注册（`__aeabi_atexit` + `__on_exit_args`），裸机上永不执行；
- *   6. 删除上游的 `operator[](...) const` 重载：它在 const 成员里调用非 const 的
- *      `exist()/find()`，任何实例化都会编译失败，且 `_size++` 被注释后返回 `_values[-1]`。
+ *   2. `erase()` 只在找到键时才移动元素并递减计数；
+ *   3. `operator[]` 增加容量检查，满了返回哨兵并可通过 `full()` 查询；
+ *   4. 存储用 C 数组而非 `std::array`：后者的 `operator[]` 会实例化
+ *      `__glibcxx_assert` → `fprintf` + `abort` 路径，把 newlib 的
+ *      stdio/malloc 链进固件，且该断言在本表的 ISR 调用点上是可达的；
+ *   5. 构造/析构改为 `= default`：用户析构会让函数内静态对象需要
+ *      `__cxa_atexit` 注册，裸机上永不执行；
+ *   6. 删除上游的 `operator[](...) const` 重载：它在 const 成员里调用
+ *      非 const 的 `exist()/find()`，任何实例化都会编译失败。
  */
 template <typename K, typename V> class map_t
 {

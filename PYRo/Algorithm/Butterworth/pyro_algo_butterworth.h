@@ -104,10 +104,10 @@ template <std::size_t Channels> class butterworth_lpf_t
             return PYRO_OK;
         }
 
-        /* dt 缓存：变步长下只在 dt 改变时重算系数（含 exp/cos/sin，M4F 无双精度
-         * FPU 时每次约 20~40 us）。用相对容差替代精确相等：dt 由
-         * ticks * timestamp_tick_s 算出，理论上恒定，但采样抖动会让末位差 1 ULP，
-         * 精确相等会把缓存打穿、退化到每样本都重算。 */
+        /* dt 缓存：变步长下只在 dt 改变时重算系数（含 exp/cos/sin，代价较高）。
+         * 用相对容差替代精确相等：dt 由 ticks * timestamp_tick_s 算出，
+         * 理论上恒定，但采样抖动会让末位差 1 ULP，精确相等会把缓存打穿、
+         * 退化到每样本都重算。 */
         const bool period_changed =
             (_cached_period <= 0.0f) ||
             (std::fabs(dt - _cached_period) > (1.0e-4f * _cached_period));

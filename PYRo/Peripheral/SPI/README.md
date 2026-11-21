@@ -81,7 +81,21 @@ release_bus()              ← 归还总线
 
 裸指针的调用是一次已知地址的跳转，赋值是两条字写入，对 1 ms 采集周期最友好。
 
-### 6. ISR 路由
+### 6. 锁的参考开销
+
+以下数据取自 STM32G431（Cortex-M4 @170 MHz，Release `-Os`），**仅作量级参考**，实际值随内核、主频与 FreeRTOS 配置变化：
+
+| 操作 | 平均周期 | 换算 |
+|---|---|---|
+| `acquire_bus()`（无竞争） | 约 211 | 约 1.2 µs |
+| `release_bus()` | 约 324 | 约 1.9 µs |
+| 每拍 2 对合计 | — | 约 6.3 µs |
+
+开销主要不在算法，而在 FreeRTOS 自身的固定成本：`configASSERT` 全部启用（含 `xTaskGetSchedulerState()` 调用）、`vPortEnterCritical`/`vPortExitCritical` 为非内联函数、以及 mutex 的优先级继承记录。
+
+因此代码注释中不写具体耗时——那是平台属性，不是接口契约。
+
+### 7. ISR 路由
 
 `USE_HAL_SPI_REGISTER_CALLBACKS = 0`，`HAL_SPI_RegisterCallback` 不可用，因此用弱符号覆盖三条 HAL 回调，全部收敛到 `notify_from_isr()`：
 

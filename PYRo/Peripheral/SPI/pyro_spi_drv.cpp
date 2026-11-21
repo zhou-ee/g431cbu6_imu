@@ -67,13 +67,7 @@ status_t spi_drv_t::acquire_bus(const uint32_t waittime)
     {
         return PYRO_ERROR; /* 构造时分配失败：本实例无总线仲裁能力 */
     }
-    /* 阻塞在互斥量上：总线被别的设备占用时，调用方任务在此挂起，
-     * 而不是"查一下忙不忙然后返回失败"。超时才报 PYRO_BUSY。
-     *
-     * 实测开销（Release -Os / 170MHz）：单次约 1.2 us。
-     * 主要是 FreeRTOS 的 configASSERT（含 xTaskGetSchedulerState 调用）、
-     * 非内联的 vPortEnterCritical/vPortExitCritical，以及 mutex 的
-     * 优先级继承记录（pvTaskIncrementMutexHeldCount）。 */
+    /* 阻塞在互斥量上：总线被占用时调用方任务挂起，而非"查一下忙就返回失败"。 */
     return (xSemaphoreTake(_bus_mutex, pdMS_TO_TICKS(waittime)) == pdTRUE) ? PYRO_OK
                                                                           : PYRO_BUSY;
 }
@@ -84,8 +78,7 @@ status_t spi_drv_t::release_bus()
     {
         return PYRO_ERROR;
     }
-    /* 重复释放由设备层的幂等封装负责屏蔽（见 lsm6dsv16x_spi_t::bus_release），
-     * 这里只是一个直接的 give。实测约 1.9 us。 */
+    /* 重复释放由设备层的幂等封装屏蔽（见 lsm6dsv16x_spi_t::bus_release）。 */
     (void)xSemaphoreGive(_bus_mutex);
     return PYRO_OK;
 }

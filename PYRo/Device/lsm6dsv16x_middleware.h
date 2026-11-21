@@ -4,16 +4,14 @@
 #include "pyro_spi_drv.h"
 
 /* 单次 SPI 事务的最大数据字节数（不含地址字节）。
- * 普通寄存器读 1~2 字节；FIFO 经 read_fifo 批读：一次最多 MAX_BURST/7 = 36 个字
- * （1 字 = 1 TAG + 6 数据 = 7 字节，252 字节）。
- * 7.68 kHz 下 DIFF_FIFO 每毫秒约 +15 字，一次事务通常即够；
- * 更多时分多次事务读（每次 CS 独立拉低/拉高，FIFO 读指针连续推进，不会错位）。 */
+ * 普通寄存器读 1~2 字节；FIFO 批读一次最多 MAX_BURST/7 = 36 字
+ * （1 字 = 1 TAG + 6 数据 = 7 字节）。更多时分多次事务读——
+ * 每次 CS 独立拉低/拉高，FIFO 读指针连续推进，不会错位。 */
 constexpr uint16_t LSM6DSV16X_MAX_BURST = 256U;
 constexpr uint8_t LSM6DSV16X_TIMEOUT_MS = 0xFF;
 
-/* 单笔 DMA 事务的完成等待上限（ms）。驱动 read() 依赖它把"等通知"限时，
- * 避免总线异常时把 1 ms 采集周期拖死。正常路径远小于此值：
- * 状态帧 3 B ≈ 5 µs，满帧 252 B ≈ 380 µs（SPI 5.3125 Mbit/s）。 */
+/* 单笔 DMA 事务的完成等待上限（ms）。驱动 read() 依赖它给"等通知"限时，
+ * 避免总线异常时把采集周期拖死；正常路径远小于此值。 */
 constexpr uint32_t LSM6DSV16X_CPLT_TIMEOUT_MS = 2U;
 
 /* 普通寄存器小读使用独立缓冲；FIFO DMA 使用 read_fifo() 管理。 */

@@ -11,7 +11,7 @@ constexpr uint32_t CAN_NOTIFY_FLAGS =
     FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_FULL |
     FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_ERROR_WARNING |
     FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_BUS_OFF;
-    /* 不开 ARB/DATA_PROTOCOL_ERROR：逐帧中断，台架无 ACK 时 3 帧/ms 各触发一次，实测把融合峰值从 791 µs 抬到 1157 µs，且无人消费。 */
+    /* 不开 ARB/DATA_PROTOCOL_ERROR：它们逐帧触发中断，而当前无消费者。 */
 
 /* 撤销全部在发请求。**仅用于 BusOff 恢复**：此时发送队列已无意义，必须清空才能
  * 重新 Start。正常发送路径不得调用它——见 send_msg() 的说明。 */

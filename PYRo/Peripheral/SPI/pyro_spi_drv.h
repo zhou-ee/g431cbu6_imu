@@ -142,8 +142,8 @@ class spi_drv_t
     volatile uint32_t  _err;       /* HAL 错误码快照 */
 
     /* 事务完成钩子（ISR 上下文，给完成信号量之前调用）。单槽。
-     * 用裸函数指针而非 std::function：后者增加 1312 B Flash、
-     * 采集平均耗时 +10%。 */
+     * 用裸函数指针而非 std::function：后者在 ISR 中多一层间接调用、
+     * 且构造/赋值开销更高，详见 README。 */
     void (*_cplt_hook)(void *){nullptr};
     void *_cplt_ctx{nullptr};
 };

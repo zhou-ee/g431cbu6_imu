@@ -418,12 +418,12 @@ status_t vqf_eskf_t::_rotate_covariance()
  * 保持相同的乘加顺序，因此结果逐位不变。
  * 返回码：矩阵乘法失败时返回错误（原实现走 operator*，失败被静默吞掉）。
  *
- * trig 复用（2026-11-17）：_update_gyr 在同一个样本上先后调用 rotation_step()
+ * trig 复用：_update_gyr 在同一个样本上先后调用 rotation_step()
  * （用半角 h=|v|/2 求 sin/cos）与本函数（用全角 |v| 求 sin/cos），
  * 两套超越函数共 4 次调用。现由 rotation_step 把 sin/cos(h) 算出来经
  * _trig 传进来，本函数用半角公式反推：
  *   sin|v| = 2·sh·ch,  cos|v| = ch² - sh²
- * 每样本省下 2 次 sinf/cosf（M4F 上各约 20~30 周期）。
+ * 每样本省下 2 次 sinf/cosf。
  * 半角公式在 |v|→0 时无精度问题（sin|v|→0、cos|v|→1），且小角分支
  * 仍走下面的泰勒展开，不参与此路径。 */
 status_t vqf_eskf_t::_compute_left_jacobian(const vector3_t &angle)
