@@ -1,7 +1,7 @@
 #ifndef __LSM6DSV16X_DRV_H__
 #define __LSM6DSV16X_DRV_H__
 #include "imu_base_drv.h"
-#include "lsm6dsv16x_middleware.h"
+#include "../../../Device/lsm6dsv16x/lsm6dsv16x_middleware.h"
 
 /* 每流样本容量。SPSC 环形缓冲，必须是 2 的幂（掩码代替取模）；留一个哨兵槽
  * 判别满，故实际可用深度 = 63。

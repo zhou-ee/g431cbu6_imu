@@ -11,7 +11,7 @@
   */
 
 #include "lsm6dsv16x_drv.h"
-#include "lsm6dsv16x_reg.h"
+#include "../../../Device/lsm6dsv16x/lsm6dsv16x_reg.h"
 
 using namespace LSM6DSV16X;
 

@@ -53,7 +53,7 @@ target_sources(PYRo PRIVATE
         # --- IMU ---
         Component/IMU/imu_base_drv.cpp
         Component/IMU/lsm6dsv16x/lsm6dsv16x_drv.cpp
-        Device/lsm6dsv16x_middleware.cpp
+        Device/lsm6dsv16x/lsm6dsv16x_middleware.cpp
         Component/IMU/BMI088/BMI088_driver.cpp
         Device/BMI088/BMI088_middleware.cpp
 )
@@ -84,6 +84,7 @@ target_include_directories(PYRo PUBLIC
         Component/IMU/lsm6dsv16x
         Component/IMU/BMI088
         Device
+        Device/lsm6dsv16x
         Device/BMI088
 )
 
